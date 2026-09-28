@@ -7,7 +7,8 @@ issue: https://github.com/NodeOps-app/paperclip/issues/2
 related_issues:
   - https://github.com/NodeOps-app/paperclip/issues/3
 branch: feat/createos-provider-capabilities
-pull_requests: []
+pull_requests:
+  - https://github.com/NodeOps-app/paperclip/pull/6
 dependencies:
   - "CreateOS live endpoint, API key, shape, adapter-ready rootfs, and Claude test login for the opt-in smoke"
   - "GitHub CI, Greptile, and maintainer review"
@@ -57,7 +58,7 @@ CreateOS environments can restrict outbound traffic, select an adapter-compatibl
 - [x] Extend `src/plugin.live.test.ts` with concurrent transfer, exact-byte, fixed-size PTY, duplex echo/stop/close, reuse, and final-destroy coverage. Live egress allow/deny and orphan inspection still require credentials and endpoints.
 - [ ] Run a Paperclip setup-token login against the CreateOS environment and record redacted end-to-end evidence without retaining the login code or credential.
 - [x] Update `README.md` with field examples, merge precedence, allow-all/no-deny-all semantics, adapter fallback behavior, reuse invalidation, concurrent-sync support, PTY/duplex boundaries, fixed initial terminal size, journal-eviction behavior, and live-test variables.
-- [ ] Prepare one PR from `feat/createos-provider-capabilities`; use every section of `.github/PULL_REQUEST_TEMPLATE.md`, link `Closes: NodeOps-app/paperclip#2` after native auto-pause live proof and `Refs: NodeOps-app/paperclip#3` because dynamic resize is not in the current contract, name the security impact, record the model, and do not merge.
+- [x] Prepare one PR from `feat/createos-provider-capabilities`; use every section of `.github/PULL_REQUEST_TEMPLATE.md`, link `Closes: NodeOps-app/paperclip#2` after native auto-pause live proof and `Refs: NodeOps-app/paperclip#3` because dynamic resize is not in the current contract, name the security impact, record the model, and do not merge.
 
 ## Acceptance
 
@@ -118,6 +119,7 @@ CreateOS environments can restrict outbound traffic, select an adapter-compatibl
 - 2026-09-28: Bhautik superseded the earlier auto-pause exclusion. Added CreateOS-native idle pause as the reusable-lease warm window while preserving the guaranteed-expiry rejection.
 - 2026-09-28: Verified both lifecycle modes against CreateOS. A disposable sandbox omitted `auto_pause_after_seconds`, executed successfully, and was explicitly deleted. A reusable sandbox reported a 60-second window, auto-paused, resumed as the same sandbox, retained its workspace marker, and was deleted. The focused plugin lifecycle suite passed all 47 tests.
 - 2026-09-28: Repeated the reusable lifecycle after the CreateOS paused-sandbox egress `503` fix. Paperclip reapplied egress, resumed the same auto-paused sandbox, executed a command, and preserved its workspace marker.
+- 2026-09-28: Opened PR #6. It closes issue #2, references issue #3, and leaves issue #4 out of scope.
 
 ## Result and retro
 
