@@ -87,17 +87,28 @@ export class CreateosClient {
     return { id, status: data.status };
   }
 
-  async createSandbox(signal: AbortSignal): Promise<Sandbox> {
-    const { shape, rootfs, region } = this.config;
+  async createSandbox(signal: AbortSignal, options: {
+    rootfs: string | null;
+    egress: string[];
+    autoPauseAfterSeconds: number | null;
+  }): Promise<Sandbox> {
+    const { shape, region } = this.config;
+    const { rootfs, egress, autoPauseAfterSeconds } = options;
     const data = await this.json("/sandboxes", "POST", {
       shape,
       ...(rootfs ? { rootfs } : {}),
       ...(region ? { region } : {}),
+      ...(egress.length ? { egress } : {}),
+      ...(autoPauseAfterSeconds != null ? { auto_pause_after_seconds: autoPauseAfterSeconds } : {}),
       ingress_enabled: false,
-      // The host owns lease release. Idle pause is not a command timeout or a
-      // guaranteed expiry, and could suspend a quiet active agent.
+      // CreateOS owns the idle timer. Paperclip still owns explicit destruction
+      // and treats auto-pause as reuse optimization, never guaranteed expiry.
     }, signal);
     return { id: identifier(data.id) };
+  }
+
+  async setEgress(id: string, egress: string[], signal: AbortSignal): Promise<void> {
+    await this.json(`/sandboxes/${identifier(id)}/egress`, "PUT", { egress }, signal);
   }
 
   async destroySandbox(id: string): Promise<void> {

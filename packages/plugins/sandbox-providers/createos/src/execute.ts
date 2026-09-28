@@ -29,7 +29,7 @@ function commandScript(params: PluginEnvironmentExecuteParams, stdinPath: string
   ].filter(Boolean).join("\n");
 }
 
-async function* events(response: Response): AsyncGenerator<Record<string, unknown>> {
+export async function* processEvents(response: Response): AsyncGenerator<Record<string, unknown>> {
   if (!response.body) throw new Error("CreateOS returned an empty process stream.");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -60,6 +60,77 @@ async function* events(response: Response): AsyncGenerator<Record<string, unknow
 function parseEvent(line: string): Record<string, unknown> {
   try { return object(JSON.parse(line)); }
   catch { throw new Error("CreateOS returned an invalid process frame."); }
+}
+
+export interface ProcessExit {
+  exitCode: number | null;
+  signal: string | null;
+}
+
+export async function followProcess(
+  client: CreateosClient,
+  sandboxId: string,
+  processId: string,
+  signal: AbortSignal,
+  onData: (stream: "stdout" | "stderr" | "pty", bytes: Buffer) => void,
+): Promise<ProcessExit> {
+  const base = `/sandboxes/${identifier(sandboxId)}/processes/${identifier(processId)}`;
+  let cursor = 0;
+  let reconnects = 0;
+  for (;;) {
+    signal.throwIfAborted();
+    let response: Response;
+    try {
+      response = await client.request(`${base}/connect?after=${cursor}`, { signal });
+    } catch (error) {
+      if (error instanceof CreateosApiError && error.status === 410) {
+        throw new Error("CreateOS process output was evicted before it could be read.");
+      }
+      if (signal.aborted || (error instanceof CreateosApiError && error.status < 500 && error.status !== 429)) throw error;
+      if (++reconnects > 3) throw new Error("CreateOS process output connection failed.");
+      await delay(250, undefined, { signal });
+      continue;
+    }
+    try {
+      for await (const event of processEvents(response)) {
+        if (event.type === "heartbeat") continue;
+        if (event.type === "data") {
+          const seq = event.seq;
+          if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1) throw new Error("CreateOS process sequence is invalid.");
+          if (seq <= cursor) continue;
+          if (seq !== cursor + 1) throw new Error("CreateOS process output has a sequence gap.");
+          if ((event.stream !== "stdout" && event.stream !== "stderr" && event.stream !== "pty") ||
+              typeof event.data_base64 !== "string" ||
+              !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(event.data_base64)) {
+            throw new Error("CreateOS process output is invalid.");
+          }
+          onData(event.stream, Buffer.from(event.data_base64, "base64"));
+          cursor = seq;
+        } else if (event.type === "exit") {
+          const exitCode = event.exit_code;
+          const exitSignal = event.signal;
+          if (!(typeof exitCode === "number" && Number.isInteger(exitCode)) &&
+              !(typeof exitSignal === "string" && /^SIG[A-Z0-9]+$/.test(exitSignal))) {
+            throw new Error("CreateOS process exit status is missing.");
+          }
+          return {
+            exitCode: typeof exitCode === "number" ? exitCode : null,
+            signal: typeof exitSignal === "string" ? exitSignal : null,
+          };
+        } else if (event.type === "error") {
+          throw new Error(event.error === "output_offset_expired"
+            ? "CreateOS process output was evicted before it could be read."
+            : "CreateOS process stream reported an error.");
+        } else {
+          throw new Error("CreateOS returned an unknown process event.");
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof TypeError) || signal.aborted) throw error;
+    }
+    if (++reconnects > 3) throw new Error("CreateOS process stream ended without an exit status.");
+    await delay(250, undefined, { signal });
+  }
 }
 
 class Output {
@@ -103,7 +174,6 @@ export async function execute(
   let creationMayHaveSucceeded = false;
   let completed = false;
   let staged = false;
-  let cursor = 0;
   const base = `/sandboxes/${id}/processes`;
   try {
     if (stdinPath) {
@@ -131,67 +201,18 @@ export async function execute(
     catch (error) {
       if (!(error instanceof CreateosApiError && error.status === 409)) throw error;
     }
-    let reconnects = 0;
-    for (;;) {
-      signal.throwIfAborted();
-      let response: Response;
-      try {
-        response = await client.request(`${base}/${processId}/connect?after=${cursor}`, { signal });
-      } catch (error) {
-        if (error instanceof CreateosApiError && error.status === 410) {
-          throw new Error("CreateOS process output was evicted before it could be read.");
-        }
-        if (signal.aborted || (error instanceof CreateosApiError && error.status < 500 && error.status !== 429)) throw error;
-        if (++reconnects > 3) throw new Error("CreateOS process output connection failed.");
-        await delay(250, undefined, { signal });
-        continue;
-      }
-      try {
-        for await (const event of events(response)) {
-          if (event.type === "heartbeat") continue;
-          if (event.type === "data") {
-            const seq = event.seq;
-            if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1) throw new Error("CreateOS process sequence is invalid.");
-            if (seq <= cursor) continue;
-            if (seq !== cursor + 1) throw new Error("CreateOS process output has a sequence gap.");
-            if ((event.stream !== "stdout" && event.stream !== "stderr") ||
-                typeof event.data_base64 !== "string" ||
-                !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(event.data_base64)) {
-              throw new Error("CreateOS process output is invalid.");
-            }
-            output.write(event.stream, Buffer.from(event.data_base64, "base64"));
-            cursor = seq;
-          } else if (event.type === "exit") {
-            const exitCode = event.exit_code;
-            const exitSignal = event.signal;
-            if (!(typeof exitCode === "number" && Number.isInteger(exitCode)) &&
-                !(typeof exitSignal === "string" && /^SIG[A-Z0-9]+$/.test(exitSignal))) {
-              throw new Error("CreateOS process exit status is missing.");
-            }
-            completed = true;
-            output.finish();
-            return {
-              exitCode: typeof exitCode === "number" ? exitCode : null,
-              signal: typeof exitSignal === "string" ? exitSignal : null,
-              timedOut: false, stdout: output.stdout, stderr: output.stderr,
-              metadata: { processId, outputTruncated: output.truncated },
-            };
-          } else if (event.type === "error") {
-            throw new Error(event.error === "output_offset_expired"
-              ? "CreateOS process output was evicted before it could be read."
-              : "CreateOS process stream reported an error.");
-          } else {
-            throw new Error("CreateOS returned an unknown process event.");
-          }
-        }
-      } catch (error) {
-        // Network read failures can resume from the last accepted sequence.
-        // Protocol errors must fail closed rather than reconnect past bad data.
-        if (!(error instanceof TypeError) || signal.aborted) throw error;
-      }
-      if (++reconnects > 3) throw new Error("CreateOS process stream ended without an exit status.");
-      await delay(250, undefined, { signal });
-    }
+    const exit = await followProcess(client, id, processId, signal, (stream, bytes) => {
+      if (stream === "pty") throw new Error("CreateOS pipe process returned PTY output.");
+      output.write(stream, bytes);
+    });
+    completed = true;
+    output.finish();
+    return {
+      exitCode: exit.exitCode,
+      signal: exit.signal,
+      timedOut: false, stdout: output.stdout, stderr: output.stderr,
+      metadata: { processId, outputTruncated: output.truncated },
+    };
   } catch (error) {
     if (creationMayHaveSucceeded && !processId) {
       throw new CreateosCleanupError("CreateOS process creation could not be confirmed; destroy the lease before reusing it.");

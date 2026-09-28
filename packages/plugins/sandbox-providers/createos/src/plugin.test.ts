@@ -4,10 +4,11 @@ import { parseConfig } from "./config.js";
 import manifest from "./manifest.js";
 import { execute } from "./execute.js";
 import { CreateosClient } from "./client.js";
+import type { PluginContext } from "@paperclipai/plugin-sdk";
 vi.mock("./request-pacer.js", () => ({ waitForRequest: vi.fn().mockResolvedValue(undefined) }));
 
 const config = { apiUrl: "https://createos.example.test", apiKey: "test-secret", shape: "test-shape", timeoutMs: 5000 };
-const base = { driverKey: "createos", companyId: "company-a", environmentId: "env-a", config };
+const base = { driverKey: "createos", companyId: "company-a", environmentId: "env-a", issueId: "issue-a", config };
 const success = (data: unknown = {}) => Response.json({ status: "success", data });
 const failure = (status: number) => Response.json({ status: "fail", data: "private provider diagnostics test-secret" }, { status });
 const data = (seq: number, text: string | Buffer, stream = "stdout") => ({ type: "data", seq, stream, data_base64: Buffer.from(text).toString("base64") });
@@ -20,6 +21,7 @@ function provider() {
   const calls: Call[] = [];
   let state = "running";
   let marker = "";
+  let processCount = 0;
   const fetchMock = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
     const parsed = new URL(String(url));
     const path = parsed.pathname + parsed.search;
@@ -34,6 +36,7 @@ function provider() {
     if (path === "/v1/sandboxes/sb_test" && method === "DELETE") { state = "destroyed"; return success({ id: "sb_test" }); }
     if (path.endsWith("/pause")) { state = "paused"; return success({ status: "pausing" }); }
     if (path.endsWith("/resume")) { state = "running"; return success({ status: "resuming" }); }
+    if (path.endsWith("/egress") && method === "PUT") return success({ id: "sb_test", egress: body.egress });
     if (parsed.pathname.endsWith("/files") && method === "PUT") {
       if (parsed.searchParams.get("path")?.endsWith(".paperclip-createos-lease")) marker = raw;
       return success();
@@ -43,9 +46,12 @@ function provider() {
       // These sandboxes declare no creation-time env keys. Match the real
       // provider's rejection of undeclared API-level overrides.
       if (Object.keys((body.env ?? {}) as object).length) return failure(400);
-      return success({ process_id: "proc_test" });
+      processCount++;
+      return success({ process_id: processCount === 1 ? "proc_test" : `proc_test_${processCount}` });
     }
+    if (path.endsWith("/input")) return success({ input_seq: 1 });
     if (path.endsWith("/stdin/close")) return success();
+    if (path.endsWith("/signal")) return success();
     if (parsed.pathname.endsWith("/connect")) return ndjson([data(1, "paperclip-createos-ready\n"), { type: "exit", exit_code: 0 }]);
     if (method === "DELETE" && path.includes("/processes/")) return success({ tree_exited: true });
     throw new Error(`Unhandled fixture request ${method} ${path}`);
@@ -62,18 +68,26 @@ beforeEach(() => { vi.stubEnv("CREATEOS_API_KEY", ""); });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe("CreateOS lifecycle", () => {
-  it("acquires, executes, realizes, pauses, resumes, and destroys using public API envelopes", async () => {
+  it("acquires, executes, leaves a reusable sandbox warm, resumes after provider pause, and destroys", async () => {
     const fake = provider();
     const hooks = createPlugin().definition;
     const params = { ...base, config: { ...config, reuseLease: true, rootfs: "tpl_ready", region: "us" } };
     const lease = await hooks.onEnvironmentAcquireLease!({ ...params, runId: "run-a" });
-    expect(fake.calls[0].body).toEqual({ shape: "test-shape", rootfs: "tpl_ready", region: "us", ingress_enabled: false });
+    expect(fake.calls[0].body).toEqual({
+      shape: "test-shape", rootfs: "tpl_ready", region: "us",
+      auto_pause_after_seconds: 600, ingress_enabled: false,
+    });
     expect(JSON.stringify(lease)).not.toContain("test-secret");
     expect(await hooks.onEnvironmentRealizeWorkspace!({ ...params, lease, workspace: { localPath: "/private/host/path" } })).toMatchObject({ cwd: "/paperclip-workspace" });
     expect(await hooks.onEnvironmentExecute!({ ...params, lease, command: "echo" })).toMatchObject({ exitCode: 0, timedOut: false });
     await hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata });
-    expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(true);
+    expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
+    fake.setState("paused");
     expect(await hooks.onEnvironmentResumeLease!({ ...params, providerLeaseId: lease.providerLeaseId!, leaseMetadata: lease.metadata })).toMatchObject({ providerLeaseId: "sb_test" });
+    const egress = fake.calls.findIndex((call) => call.path.endsWith("/egress"));
+    const resume = fake.calls.findIndex((call) => call.path.endsWith("/resume"));
+    expect(egress).toBeGreaterThan(-1);
+    expect(egress).toBeLessThan(resume);
     await hooks.onEnvironmentDestroyLease!({ ...params, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata });
     expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
   });
@@ -86,6 +100,37 @@ describe("CreateOS lifecycle", () => {
     expect(fake.calls.at(-1)?.method).toBe("DELETE");
     fake.fetchMock.mockImplementation(async (url, init) => init?.method === "DELETE" ? failure(500) : String(url).endsWith("/exec") ? failure(503) : normal(url, init));
     await expect(createPlugin().definition.onEnvironmentAcquireLease!({ ...base, runId: "run" })).rejects.toThrow("cleanup is unconfirmed");
+  });
+
+  it("omits native auto-pause for disposable leases and destroys leases without a matching guard", async () => {
+    const disposable = provider();
+    await createPlugin().definition.onEnvironmentAcquireLease!({ ...base, runId: "disposable" });
+    expect(disposable.calls[0].body).not.toHaveProperty("auto_pause_after_seconds");
+
+    const login = provider();
+    const loginHooks = createPlugin().definition;
+    const loginParams = { ...base, issueId: null, config: { ...config, reuseLease: true } };
+    const loginLease = await loginHooks.onEnvironmentAcquireLease!({ ...loginParams, runId: "login" });
+    expect(login.calls[0].body).not.toHaveProperty("auto_pause_after_seconds");
+    await loginHooks.onEnvironmentReleaseLease!({
+      ...loginParams,
+      providerLeaseId: loginLease.providerLeaseId,
+      leaseMetadata: loginLease.metadata,
+    });
+    expect(login.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
+
+    const guarded = provider();
+    const hooks = createPlugin().definition;
+    const original = { ...base, config: { ...config, reuseLease: true, autoPauseAfterSeconds: 600 } };
+    const lease = await hooks.onEnvironmentAcquireLease!({ ...original, runId: "reusable" });
+    await hooks.onEnvironmentReleaseLease!({
+      ...original,
+      config: { ...original.config, autoPauseAfterSeconds: 900 },
+      providerLeaseId: lease.providerLeaseId,
+      leaseMetadata: lease.metadata,
+    });
+    expect(guarded.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
+    expect(guarded.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
   });
 
   it("rejects guaranteed-expiry leases before provisioning", async () => {
@@ -142,13 +187,167 @@ describe("CreateOS lifecycle", () => {
     expect(fake.fetchMock).not.toHaveBeenCalled();
   });
 
+  it("selects an adapter image and merges environment and task egress grants", async () => {
+    const fake = provider();
+    const hooks = createPlugin().definition;
+    const params = {
+      ...base,
+      config: {
+        ...config,
+        rootfs: "fallback",
+        rootfsByAdapter: { codex: "codex-ready" },
+        egressAllowlist: ["registry.npmjs.org", "*"],
+      },
+      adapterType: "codex",
+      executionWorkspaceSettings: {
+        networkEgress: { allowFqdns: ["github.com"], allowCidrs: ["10.0.0.0/8"] },
+      },
+      runId: "run",
+    };
+    const lease = await hooks.onEnvironmentAcquireLease!(params);
+    expect(fake.calls[0].body).toMatchObject({
+      rootfs: "codex-ready",
+      egress: ["registry.npmjs.org", "github.com", "10.0.0.0/8"],
+    });
+    expect(lease.metadata).toMatchObject({ adapterType: "codex", rootfs: "codex-ready" });
+  });
+
+  it("expires a reusable lease before provider access when adapter image, base egress, or auto-pause changes", async () => {
+    const fake = provider();
+    const hooks = createPlugin().definition;
+    const params = {
+      ...base,
+      config: { ...config, reuseLease: true, rootfsByAdapter: { codex: "codex-ready" }, egressAllowlist: ["github.com"] },
+      adapterType: "codex",
+      runId: "run",
+    };
+    const lease = await hooks.onEnvironmentAcquireLease!(params);
+    fake.fetchMock.mockClear();
+    for (const changedConfig of [
+      { ...params.config, rootfsByAdapter: { codex: "codex-v2" } },
+      { ...params.config, egressAllowlist: ["example.com"] },
+      { ...params.config, autoPauseAfterSeconds: 900 },
+    ]) {
+      expect(await hooks.onEnvironmentResumeLease!({
+        ...base, config: changedConfig, providerLeaseId: "sb_test", leaseMetadata: lease.metadata,
+      })).toMatchObject({ providerLeaseId: null });
+    }
+    expect(fake.fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a fixed-command login PTY and forwards PTY output", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/connect?")) return ndjson([data(1, "Device code: TEST\n", "pty"), { type: "exit", exit_code: 0 }]);
+      return normal(url, init);
+    });
+    const output = vi.fn();
+    const exit = vi.fn();
+    const hooks = createPlugin().definition;
+    await hooks.setup!({
+      logger: { info: vi.fn() },
+      loginPty: { output, exit },
+      duplexChannel: { data: vi.fn(), exit: vi.fn() },
+    } as unknown as PluginContext);
+    await hooks.onEnvironmentAcquireLease!({ ...base, runId: "run" });
+    const result = await hooks.onLoginPtyOpen!({
+      hostRouteId: "login-route", driverKey: "createos", companyId: base.companyId,
+      environmentId: base.environmentId, providerLeaseId: "sb_test", loginCommandKey: "codex",
+      sessionHome: "/tmp/paperclip-adapter-login/123e4567-e89b-42d3-a456-426614174000",
+    });
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith("login-route", result.workerSessionId, 0));
+    expect(output).toHaveBeenCalledWith("login-route", result.workerSessionId, "Device code: TEST\n");
+    const create = fake.calls.find((call) => call.path.endsWith("/processes"))!;
+    expect(create.body).toMatchObject({ cmd: "/bin/bash", pty: { cols: 120, rows: 30 } });
+    expect(create.body).not.toHaveProperty("timeout_ms");
+    const script = (create.body.args as string[])[1];
+    expect(script).toContain("command -v 'codex'");
+    expect(script).toContain("*/.asdf/shims/*");
+    expect(script).toContain("asdf which 'codex'");
+    expect(script).toContain("PATH=\"$login_path\"");
+    expect(script).toContain("\"$login_command\" 'login' '--device-auth'");
+    expect(JSON.stringify(create.body)).toContain("CODEX_HOME=");
+  });
+
+  it("writes, stops, and closes a duplex pipe by its exact route pair", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/connect?")) return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(data(1, Buffer.from([0, 255, 1]))) + "\n"));
+          init!.signal!.addEventListener("abort", () => controller.error(init!.signal!.reason), { once: true });
+        },
+      }));
+      return normal(url, init);
+    });
+    const channelData = vi.fn();
+    const hooks = createPlugin().definition;
+    await hooks.setup!({
+      logger: { info: vi.fn() },
+      loginPty: { output: vi.fn(), exit: vi.fn() },
+      duplexChannel: { data: channelData, exit: vi.fn() },
+    } as unknown as PluginContext);
+    await hooks.onEnvironmentAcquireLease!({ ...base, runId: "run" });
+    const opened = await hooks.onDuplexChannelOpen!({
+      hostRouteId: "duplex-route", driverKey: "createos", companyId: base.companyId,
+      environmentId: base.environmentId, providerLeaseId: "sb_test", command: ["/bin/cat"],
+    });
+    const create = fake.calls.find((call) => call.path.endsWith("/processes"))!;
+    expect(create.body).not.toHaveProperty("timeout_ms");
+    await vi.waitFor(() => expect(channelData).toHaveBeenCalled());
+    expect(Buffer.from(channelData.mock.calls[0][2])).toEqual(Buffer.from([0, 255, 1]));
+    const input = Buffer.alloc(600 * 1024, 0xa5);
+    await hooks.onDuplexChannelWrite!({ ...opened, data: input.toString("base64") });
+    await hooks.onDuplexChannelWrite!({ hostRouteId: "wrong", workerSessionId: opened.workerSessionId, data: Buffer.from("ignored").toString("base64") });
+    await hooks.onDuplexChannelStop!({ ...opened });
+    const inputs = fake.calls.filter((call) => call.path.endsWith("/input"));
+    expect(inputs).toHaveLength(3);
+    expect(Buffer.concat(inputs.map((call) => Buffer.from(call.body.data_base64 as string, "base64")))).toEqual(input);
+    expect(inputs.every((call) => Buffer.from(call.body.data_base64 as string, "base64").length <= 256 * 1024)).toBe(true);
+    expect(fake.calls.some((call) => call.path.endsWith("/signal") && call.body.signal === "SIGTERM")).toBe(true);
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("grace_ms=1000"))).toBe(true);
+    expect(await hooks.onDuplexChannelClose!({ hostRouteId: "duplex-route", workerSessionId: opened.workerSessionId })).toEqual(opened);
+  });
+
+  it("refuses to leave a sandbox warm after unconfirmed channel cleanup but still allows whole-sandbox destroy", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/connect?")) return new Response(new ReadableStream({
+        start(controller) {
+          init!.signal!.addEventListener("abort", () => controller.error(init!.signal!.reason), { once: true });
+        },
+      }));
+      if (init?.method === "DELETE" && String(url).includes("/processes/")) return failure(503);
+      return normal(url, init);
+    });
+    const hooks = createPlugin().definition;
+    await hooks.setup!({
+      logger: { info: vi.fn() },
+      loginPty: { output: vi.fn(), exit: vi.fn() },
+      duplexChannel: { data: vi.fn(), exit: vi.fn() },
+    } as unknown as PluginContext);
+    const params = { ...base, config: { ...config, reuseLease: true } };
+    const lease = await hooks.onEnvironmentAcquireLease!({ ...params, runId: "run" });
+    await hooks.onDuplexChannelOpen!({
+      hostRouteId: "uncertain", driverKey: "createos", companyId: base.companyId,
+      environmentId: base.environmentId, providerLeaseId: "sb_test", command: ["/bin/cat"],
+    });
+    await expect(hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata })).rejects.toThrow("HTTP 503");
+    expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
+    await hooks.onEnvironmentDestroyLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata });
+    expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
+  });
+
   it("probes actual process execution and always deletes the sandbox", async () => {
     const fake = provider();
     expect(await createPlugin().definition.onEnvironmentProbe!(base)).toMatchObject({ ok: true });
     expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
   });
 
-  it("aborts an active command and waits for tree cleanup before pausing", async () => {
+  it("aborts an active command and waits for tree cleanup before leaving the sandbox warm", async () => {
     const fake = provider();
     const hooks = createPlugin().definition;
     const params = { ...base, config: { ...config, reuseLease: true } };
@@ -171,9 +370,8 @@ describe("CreateOS lifecycle", () => {
     await hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata });
     await rejected;
     const stop = fake.calls.findIndex((call) => call.method === "DELETE" && call.path.includes("/processes/"));
-    const pause = fake.calls.findIndex((call) => call.path.endsWith("/pause"));
     expect(stop).toBeGreaterThan(-1);
-    expect(pause).toBeGreaterThan(stop);
+    expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
   });
 
   it("blocks reuse after ambiguous process creation until the sandbox is destroyed", async () => {
@@ -296,7 +494,34 @@ describe("CreateOS configuration", () => {
   it("normalizes /v1 URLs and keeps the shape explicit", () => {
     expect(parseConfig({ ...config, apiUrl: config.apiUrl + "/v1/" }).apiUrl).toBe(config.apiUrl);
     expect(() => parseConfig({ ...config, shape: "" })).toThrow("shape");
-    expect(manifest.environmentDrivers?.[0].supportsLoginPty).not.toBe(true);
+    expect(manifest.environmentDrivers?.[0].supportsLoginPty).toBe(true);
+    expect(manifest.environmentDrivers?.[0].sandboxCapabilities).toMatchObject({
+      concurrentSyncOperations: true,
+      duplexCommandStream: true,
+    });
+    const hooks = createPlugin().definition;
+    for (const name of [
+      "onEnvironmentSyncIn", "onEnvironmentSyncOut",
+      "onLoginPtyOpen", "onLoginPtyInput", "onLoginPtyStop", "onLoginPtyClose",
+      "onDuplexChannelOpen", "onDuplexChannelWrite", "onDuplexChannelStop", "onDuplexChannelClose",
+    ] as const) expect(hooks[name]).toBeTypeOf("function");
+  });
+
+  it("validates adapter images and egress lists", () => {
+    expect(parseConfig({ ...config, rootfsByAdapter: { codex: " codex-ready " }, egressAllowlist: ["github.com", "github.com"] })).toMatchObject({
+      rootfsByAdapter: { codex: "codex-ready" }, egressAllowlist: ["github.com"],
+    });
+    expect(() => parseConfig({ ...config, rootfsByAdapter: [] })).toThrow("rootfsByAdapter");
+    expect(() => parseConfig({ ...config, egressAllowlist: [""] })).toThrow("egressAllowlist");
+  });
+
+  it("defaults and validates the native CreateOS auto-pause window", () => {
+    expect(parseConfig(config).autoPauseAfterSeconds).toBe(600);
+    expect(parseConfig({ ...config, autoPauseAfterSeconds: 60 }).autoPauseAfterSeconds).toBe(60);
+    expect(parseConfig({ ...config, autoPauseAfterSeconds: 86_400 }).autoPauseAfterSeconds).toBe(86_400);
+    for (const value of [59, 86_401, 1.5, "600"]) {
+      expect(() => parseConfig({ ...config, autoPauseAfterSeconds: value })).toThrow("autoPauseAfterSeconds");
+    }
   });
 
   it.each(["https://user:secret@host.test", "https://host.test/?key=secret", "http://remote.test", "file:///tmp/socket", "https://host.test/other"])("rejects unsafe API URL %s", (apiUrl) => {

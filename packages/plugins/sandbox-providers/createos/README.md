@@ -64,11 +64,23 @@ Optional fields:
   utilities including `tar`, `base64`, and GNU `realpath` (`-m` support), and the selected adapter's runtime
   dependencies (such as Node and Git). The generic runtime provisions/stages
   agent assets; this plugin does not build an agent image.
+- `rootfsByAdapter`: optional adapter-to-rootfs map. For each newly acquired
+  lease, `rootfsByAdapter[adapterType]` overrides `rootfs`; changing the
+  effective image expires a reusable lease before any provider API call.
+- `egressAllowlist`: base list of allowed FQDNs and CIDRs. Paperclip merges it
+  with the run's `networkEgress.allowFqdns` and `allowCidrs`. Missing, empty,
+  `null`, and `["*"]` use CreateOS allow-all semantics; a non-empty restrictive
+  list is deny-by-default. A wildcard is removed when restrictive entries are
+  also present. There is no synthetic deny-all rule.
 - `region`: must match the API endpoint. Omission uses the provider default.
 - `timeoutMs`: operation/default command deadline, 300000 ms by default. This
   is **not** a sandbox TTL.
-- `reuseLease`: default false. False deletes on release; true waits for pause
-  completion and later resumes the same sandbox, preserving workspace data.
+- `reuseLease`: default false. False deletes on release. True leaves the sandbox
+  warm after release and later reuses the same sandbox, preserving workspace data.
+- `autoPauseAfterSeconds`: for reusable leases, the CreateOS-native inactivity
+  window before the warm sandbox pauses. Defaults to 600 seconds; valid values
+  are 60–86400. Paperclip resumes an auto-paused sandbox on the next run. This
+  is an idle-cost control, not a guaranteed sandbox expiry.
 
 The probe creates a sandbox, prepares its workspace, executes a managed
 command, and deletes the sandbox. It therefore uses real provider resources.
@@ -77,8 +89,13 @@ command, and deletes the sandbox. It therefore uses real provider resources.
 
 - Company/environment-bound lease metadata and a random workspace marker
   checked before a resumed lease is trusted. API keys are not lease metadata.
-- State-aware pause/resume with bounded polling. Transient errors are surfaced;
-  only missing/terminal sandboxes or a mismatched workspace expire a resume.
+- Provider-native idle pause for reusable leases. Paperclip leaves a released
+  sandbox warm, then accepts either `running` or auto-paused state on the next
+  resume. Transient errors are surfaced; only missing/terminal sandboxes or a
+  mismatched workspace expire a resume.
+- Creation-time egress policy and live egress replacement before a reusable
+  sandbox resumes. The base policy, effective per-run policy, adapter, and
+  effective rootfs are recorded without credentials in lease metadata.
 - Managed pipe processes with explicit working directory, quoted arguments,
   per-command environment, staged stdin, and separate stdout/stderr.
   Per-command variables are applied by the command wrapper; CreateOS's API-level
@@ -104,13 +121,34 @@ command, and deletes the sandbox. It therefore uses real provider resources.
   output still uses that journal and fails explicitly if unread data is evicted.
   Outbound archives are validated before extraction and limited to 10 GiB of
   declared file data; absolute/traversing paths and escaping links are rejected.
+- Concurrent inbound/outbound sync. Every call owns random sandbox scratch
+  paths and independent host temporary directories; teardown waits for all
+  active calls.
+- Interactive setup-token login PTYs for Claude, Codex, and Grok. The command
+  is selected from a closed key set, the host-controlled session home is
+  revalidated, and asdf-backed executables are resolved before switching to
+  that isolated home, with their runtime bin directory placed first on PATH.
+  The CreateOS PTY starts at 120 columns by 30 rows. The
+  current Paperclip login hook has no resize method, so live PTY resize is not
+  advertised or emulated.
+- Persistent duplex command channels over CreateOS pipe processes. Binary
+  input is decoded from the plugin wire format, serialized and split into
+  provider-safe 256 KiB writes; stdout is forwarded as raw bytes. Stop and
+  release send SIGTERM and require a whole-tree deletion receipt.
 
 ## Capability boundaries
 
-Interactive login PTYs, temporary login leases, snapshot capture,
-duplex channels, and provider WebSocket ingress are not advertised.
-CreateOS idle auto-pause is not a guaranteed absolute expiry, so acquisition
-with `requestedExpiresAt` fails before provisioning a resource.
+Temporary login leases, snapshot capture, dynamic login PTY resize, and
+provider WebSocket ingress are not advertised. Login PTYs and duplex command
+channels require a lease acquired or resumed by the current worker; after a
+worker restart they fail closed until the host restores that lease.
+Paperclip's Claude setup-token flow additionally requires a provider-attested
+absolute lease expiry. CreateOS has no hard TTL, and provider-native idle pause
+does not satisfy that guarantee, so this plugin continues to reject
+`requestedExpiresAt`; therefore that bounded setup-token flow remains
+unavailable. The PTY hooks are
+usable by login/session flows that do not request a guaranteed expiry.
+Acquisition with `requestedExpiresAt` fails before provisioning a resource.
 
 The host has an outbound-WSS native runner path for providers without ingress.
 Using it additionally requires a reachable Paperclip runner endpoint and the
@@ -133,9 +171,11 @@ and optionally `CREATEOS_ROOTFS`, then run:
 CREATEOS_LIVE_TEST=1 pnpm test
 ```
 
-The live test creates a sandbox, round-trips a 5 MiB binary file through native
-sync, checks stdin/env/output, writes a file, pauses
-and resumes the sandbox, verifies the file, and deletes it in `finally`.
+The live test creates a sandbox, overlaps native sync-in and sync-out while
+round-tripping a 5 MiB binary file, checks stdin/env/output, optional
+`CREATEOS_EGRESS_ALLOWLIST` configuration, a duplex echo/stop/close cycle, and
+a 120×30 PTY `stty size` result, writes a file, releases and resumes the warm
+sandbox, verifies the file, and deletes it in `finally`.
 It does not print credentials. Cleanup errors fail the test.
 
 ## Optional managed-image inclusion
