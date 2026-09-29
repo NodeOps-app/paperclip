@@ -1,22 +1,115 @@
 import { randomUUID, createHash } from "node:crypto";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { StringDecoder } from "node:string_decoder";
+import { decodeChannelBytes, definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginContext, PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDriverBaseParams,
   PluginEnvironmentExecuteParams, PluginEnvironmentLease, PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentInteractiveSetupSession,
 } from "@paperclipai/plugin-sdk";
 import { CreateosApiError, CreateosClient, object } from "./client.js";
-import { parseConfig, resolveApiKey } from "./config.js";
-import { CreateosCleanupError, execute, shellQuote } from "./execute.js";
+import { parseConfig, resolveApiKey, resolveEgressAllowlist, resolveRootfs, type CreateosConfig } from "./config.js";
+import { executeStream as execute, shellQuote } from "./execute.js";
 import { syncFiles } from "./file-sync.js";
+import { openManagedProcess, type ManagedProcessSession } from "./process-session.js";
 
 const CWD = "/paperclip-workspace";
 // The host excludes .paperclip-runtime from workspace export, so the lease
 // marker never becomes a user repository file.
 const MARKER = `${CWD}/.paperclip-runtime/.paperclip-createos-lease`;
 
+function loginScript(command: readonly string[], environment: string[]): string {
+  const executable = shellQuote(command[0]);
+  const args = command.slice(1).map(shellQuote);
+  return [
+    `login_command="$(command -v ${executable})" || exit 127`,
+    `login_path="$PATH"`,
+    // Resolve asdf while the sandbox's normal HOME is still active. The
+    // isolated login HOME intentionally has no asdf installation metadata.
+    // Prepending the resolved bin directory also lets /usr/bin/env shebangs
+    // find the matching runtime without falling back through the asdf shim.
+    `case "$login_command" in */.asdf/shims/*) login_command="$(asdf which ${executable})" || exit 127; login_path="\${login_command%/*}:$login_path" ;; esac`,
+    `[ -x "$login_command" ] || exit 126`,
+    `exec env ${environment.join(" ")} PATH="$login_path" "$login_command"${args.length > 0 ? ` ${args.join(" ")}` : ""}`,
+  ].join("; ");
+}
+
 function metadataMatches(params: PluginEnvironmentDriverBaseParams, metadata?: Record<string, unknown>): boolean {
   return metadata?.provider === "createos" && metadata.companyId === params.companyId &&
     metadata.environmentId === params.environmentId && metadata.apiUrl === parseConfig(params.config).apiUrl;
+}
+
+function setupMetadataMatches(
+  params: PluginEnvironmentDriverBaseParams,
+  providerLeaseId: string,
+  metadata?: Record<string, unknown>,
+): metadata is Record<string, unknown> & { setupMarker: string } {
+  return metadataMatches(params, metadata) && metadata?.sandboxId === providerLeaseId &&
+    typeof metadata.setupMarker === "string" && /^[0-9a-f-]{36}$/.test(metadata.setupMarker);
+}
+
+function setupConnection(
+  providerLeaseId: string,
+  expiresAt: string | null,
+  includePayload: boolean,
+): Pick<PluginEnvironmentInteractiveSetupSession, "connectionSummary" | "connectionPayload"> {
+  return {
+    connectionSummary: {
+      type: "createos_cli",
+      hostRedacted: true,
+      portRedacted: true,
+      commandRedacted: !includePayload,
+      expiresAt,
+      metadata: { provider: "createos" },
+    },
+    connectionPayload: includePayload ? {
+      type: "createos_cli",
+      command: `createos sandbox shell ${providerLeaseId}`,
+      expiresAt,
+      metadata: { provider: "createos" },
+    } : null,
+  };
+}
+
+function missingSetup(): PluginEnvironmentInteractiveSetupSession {
+  return {
+    providerLeaseId: null,
+    status: "missing",
+    connectionSummary: null,
+    connectionPayload: null,
+    metadata: { provider: "createos", missing: true },
+  };
+}
+
+async function prepareWorkspace(
+  client: CreateosClient,
+  sandboxId: string,
+  marker: string,
+  signal: AbortSignal,
+): Promise<void> {
+  await client.transition(sandboxId, "running", signal);
+  const data = await client.json(`/sandboxes/${sandboxId}/exec`, "POST", {
+    cmd: "/bin/bash", args: ["-lc", `mkdir -p -- ${shellQuote(CWD)}`],
+  }, signal);
+  if (object(data.result).exit_code !== 0) {
+    throw new Error("CreateOS workspace preparation failed; the image must provide Bash.");
+  }
+  await client.upload(sandboxId, MARKER, marker, signal);
+}
+
+async function verifyWorkspaceMarker(
+  client: CreateosClient,
+  sandboxId: string,
+  marker: string,
+  signal: AbortSignal,
+): Promise<void> {
+  await client.transition(sandboxId, "running", signal);
+  const data = await client.json(`/sandboxes/${sandboxId}/exec`, "POST", {
+    cmd: "/bin/cat", args: [MARKER],
+  }, signal);
+  const result = object(data.result);
+  if (result.exit_code !== 0 || result.stdout !== marker) {
+    throw new Error("CreateOS setup sandbox identity could not be verified.");
+  }
 }
 
 async function acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
@@ -25,23 +118,39 @@ async function acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<Plu
   const config = parseConfig(params.config);
   const client = new CreateosClient(config);
   const signal = AbortSignal.timeout(config.timeoutMs);
-  const sandbox = await client.createSandbox(signal);
+  const requestedRootfs = resolveRootfs(config, params.adapterType);
+  const effectiveRootfs = config.snapshot ? null : await client.resolveRootfs(requestedRootfs, signal);
+  const effectiveEgress = resolveEgressAllowlist(config, params.executionWorkspaceSettings);
+  // Login leases deliberately carry no issue or execution workspace. They are
+  // always disposable even when the environment enables reuse.
+  const effectiveAutoPause = config.reuseLease && (params.issueId || params.executionWorkspaceId)
+    ? config.autoPauseAfterSeconds
+    : null;
+  const sandbox = config.snapshot
+    ? await client.forkSandbox(config.snapshot, signal, {
+        egress: effectiveEgress,
+        autoPauseAfterSeconds: effectiveAutoPause,
+      })
+    : await client.createSandbox(signal, {
+        rootfs: effectiveRootfs,
+        egress: effectiveEgress,
+        autoPauseAfterSeconds: effectiveAutoPause,
+      });
   try {
-    await client.transition(sandbox.id, "running", signal);
-    const data = await client.json(`/sandboxes/${sandbox.id}/exec`, "POST", {
-      cmd: "/bin/bash", args: ["-lc", `mkdir -p -- ${shellQuote(CWD)}`],
-    }, signal);
-    if (object(data.result).exit_code !== 0) throw new Error("CreateOS workspace preparation failed; the image must provide Bash.");
     const marker = randomUUID();
-    await client.upload(sandbox.id, MARKER, marker, signal);
+    await prepareWorkspace(client, sandbox.id, marker, signal);
     return {
       providerLeaseId: sandbox.id,
       metadata: {
         provider: "createos", apiUrl: config.apiUrl,
         companyId: params.companyId, environmentId: params.environmentId,
         remoteCwd: CWD, shellCommand: "bash", marker,
-        shape: config.shape, rootfs: config.rootfs, region: config.region,
+        shape: config.shape, snapshot: config.snapshot, rootfs: effectiveRootfs, requestedRootfs,
+        adapterType: params.adapterType ?? null,
+        region: config.region, baseEgressAllowlist: config.egressAllowlist,
+        effectiveEgressAllowlist: effectiveEgress,
         reuseLease: config.reuseLease,
+        autoPauseAfterSeconds: effectiveAutoPause,
       },
     };
   } catch (error) {
@@ -59,6 +168,49 @@ export function createPlugin() {
   const active = new Map<string, Set<Active>>();
   const closing = new Set<string>();
   const unconfirmedCleanup = new Set<string>();
+  type LeaseEntry = { companyId: string; environmentId: string; config: CreateosConfig };
+  const leases = new Map<string, LeaseEntry>();
+  type SessionEntry = {
+    hostRouteId: string;
+    workerSessionId: string;
+    providerLeaseId: string;
+    session: ManagedProcessSession;
+  };
+  const loginByRoute = new Map<string, SessionEntry>();
+  const loginBySession = new Map<string, SessionEntry>();
+  const duplexByRoute = new Map<string, SessionEntry>();
+  const duplexBySession = new Map<string, SessionEntry>();
+
+  function registerLease(params: PluginEnvironmentDriverBaseParams, id: string) {
+    leases.set(id, { companyId: params.companyId, environmentId: params.environmentId, config: parseConfig(params.config) });
+  }
+
+  function resolveLease(params: { companyId: string; environmentId: string; providerLeaseId: string }): LeaseEntry {
+    const lease = leases.get(params.providerLeaseId);
+    if (!lease || lease.companyId !== params.companyId || lease.environmentId !== params.environmentId) {
+      throw new Error("CreateOS session requires a lease cached for this environment.");
+    }
+    return lease;
+  }
+
+  function forget(entry: SessionEntry, routes: Map<string, SessionEntry>, sessions: Map<string, SessionEntry>) {
+    if (routes.get(entry.hostRouteId) === entry) routes.delete(entry.hostRouteId);
+    if (sessions.get(entry.workerSessionId) === entry) sessions.delete(entry.workerSessionId);
+  }
+
+  async function stopLeaseSessions(providerLeaseId: string, tolerateFailure: boolean) {
+    const entries = [...loginByRoute.values(), ...duplexByRoute.values()]
+      .filter((entry) => entry.providerLeaseId === providerLeaseId);
+    const results = await Promise.allSettled(entries.map((entry) => entry.session.close()));
+    if (!tolerateFailure) {
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    }
+    for (const entry of entries) {
+      forget(entry, loginByRoute, loginBySession);
+      forget(entry, duplexByRoute, duplexBySession);
+    }
+  }
 
   function key(params: PluginEnvironmentDriverBaseParams, id: string): string {
     const config = parseConfig(params.config);
@@ -91,9 +243,6 @@ export function createPlugin() {
     active.set(scope, calls);
     try {
       return await work(new CreateosClient(config), AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]));
-    } catch (error) {
-      if (error instanceof CreateosCleanupError) unconfirmedCleanup.add(scope);
-      throw error;
     } finally {
       calls.delete(entry);
       if (calls.size === 0) active.delete(scope);
@@ -109,18 +258,26 @@ export function createPlugin() {
     if (closing.has(scope)) throw new Error("CreateOS lease cleanup is already in progress.");
     closing.add(scope);
     try {
+      try { await stopLeaseSessions(id, destroy); }
+      catch (error) {
+        unconfirmedCleanup.add(scope);
+        throw error;
+      }
       await stopActive(scope);
       const config = parseConfig(params.config);
       const client = new CreateosClient(config);
-      if (destroy || !config.reuseLease) {
+      const leaseAutoPause = params.leaseMetadata?.autoPauseAfterSeconds;
+      const reusableWithProviderGuard = config.reuseLease && leaseAutoPause === config.autoPauseAfterSeconds;
+      if (destroy || !reusableWithProviderGuard) {
         await client.destroySandbox(id);
         unconfirmedCleanup.delete(scope);
       } else {
         if (unconfirmedCleanup.has(scope)) throw new Error("CreateOS process cleanup is unconfirmed; destroy this lease before reusing it.");
-        try { await client.transition(id, "paused", AbortSignal.timeout(config.timeoutMs)); }
-        catch (error) { if (!(error instanceof CreateosApiError && error.status === 404)) throw error; }
+        // Keep the sandbox warm. CreateOS pauses it after the configured idle
+        // window; a later resume accepts either its running or paused state.
       }
     } finally {
+      leases.delete(id);
       closing.delete(scope);
     }
   }
@@ -148,7 +305,11 @@ export function createPlugin() {
         if (lease?.providerLeaseId) await new CreateosClient(parseConfig(params.config)).destroySandbox(lease.providerLeaseId);
       }
     },
-    onEnvironmentAcquireLease: acquire,
+    async onEnvironmentAcquireLease(params) {
+      const lease = await acquire(params);
+      if (lease.providerLeaseId) registerLease(params, lease.providerLeaseId);
+      return lease;
+    },
     async onEnvironmentResumeLease(params) {
       if (!metadataMatches(params, params.leaseMetadata)) throw new Error("CreateOS lease does not belong to this environment.");
       const scope = key(params, params.providerLeaseId);
@@ -156,7 +317,15 @@ export function createPlugin() {
       const marker = params.leaseMetadata?.marker;
       if (typeof marker !== "string" || !/^[0-9a-f-]{36}$/.test(marker)) return { providerLeaseId: null, metadata: { expired: true } };
       const config = parseConfig(params.config);
-      if (params.leaseMetadata?.shape !== config.shape || params.leaseMetadata.rootfs !== config.rootfs || params.leaseMetadata.region !== config.region) {
+      const adapterType = typeof params.leaseMetadata?.adapterType === "string" ? params.leaseMetadata.adapterType : undefined;
+      const configuredEgress = Array.isArray(params.leaseMetadata?.baseEgressAllowlist)
+        ? params.leaseMetadata.baseEgressAllowlist : [];
+      if (params.leaseMetadata?.shape !== config.shape ||
+          params.leaseMetadata.snapshot !== config.snapshot ||
+          params.leaseMetadata.requestedRootfs !== resolveRootfs(config, adapterType) ||
+          params.leaseMetadata.region !== config.region ||
+          params.leaseMetadata.autoPauseAfterSeconds !== (config.reuseLease ? config.autoPauseAfterSeconds : null) ||
+          JSON.stringify(configuredEgress) !== JSON.stringify(config.egressAllowlist)) {
         return { providerLeaseId: null, metadata: { expired: true } };
       }
       const client = new CreateosClient(config);
@@ -164,12 +333,18 @@ export function createPlugin() {
       try {
         const sandbox = await client.getSandbox(params.providerLeaseId, signal);
         if (["destroyed", "failed"].includes(sandbox.status!)) return { providerLeaseId: null, metadata: { expired: true } };
+        const egress = params.leaseMetadata?.effectiveEgressAllowlist;
+        if (!Array.isArray(egress) || egress.some((entry) => typeof entry !== "string")) {
+          return { providerLeaseId: null, metadata: { expired: true } };
+        }
+        await client.setEgress(params.providerLeaseId, egress, signal);
         await client.transition(params.providerLeaseId, "running", signal);
         const data = await client.json(`/sandboxes/${params.providerLeaseId}/exec`, "POST", {
           cmd: "/bin/cat", args: [MARKER],
         }, signal);
         const result = object(data.result);
         if (result.exit_code !== 0 || result.stdout !== marker) return { providerLeaseId: null, metadata: { expired: true } };
+        registerLease(params, params.providerLeaseId);
         return { providerLeaseId: params.providerLeaseId, metadata: { ...params.leaseMetadata, resumedLease: true } };
       } catch (error) {
         if (error instanceof CreateosApiError && error.status === 404) return { providerLeaseId: null, metadata: { expired: true } };
@@ -184,15 +359,274 @@ export function createPlugin() {
       // The runtime's source mappings stage into this provider workspace.
       return { cwd: CWD, metadata: { provider: "createos", remoteCwd: CWD } };
     },
+    async onEnvironmentStartInteractiveSetup(params) {
+      const config = parseConfig(params.config);
+      if (params.sourceTemplateRef && params.sourceTemplateKind && params.sourceTemplateKind !== "snapshot") {
+        throw new Error(`CreateOS can start from snapshot templates only, not ${params.sourceTemplateKind}.`);
+      }
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(config.timeoutMs);
+      const setupMarker = randomUUID();
+      let sandboxId: string | null = null;
+      try {
+        const sandbox = params.sourceTemplateRef
+          ? await client.forkSandbox(params.sourceTemplateRef, signal, {
+              egress: config.egressAllowlist,
+              autoPauseAfterSeconds: null,
+            })
+          : await client.createSandbox(signal, {
+              rootfs: await client.resolveRootfs(resolveRootfs(config), signal),
+              egress: config.egressAllowlist,
+              autoPauseAfterSeconds: null,
+            });
+        sandboxId = sandbox.id;
+        // Interactive setup must stay available until the host session expires
+        // or the user explicitly finishes/cancels it.
+        await client.setAutoPause(sandbox.id, null, signal);
+        await prepareWorkspace(client, sandbox.id, setupMarker, signal);
+        const expiresAt = params.expiresAt ?? null;
+        return {
+          providerLeaseId: sandbox.id,
+          status: "waiting_for_user",
+          expiresAt,
+          ...setupConnection(sandbox.id, expiresAt, true),
+          metadata: {
+            provider: "createos",
+            apiUrl: config.apiUrl,
+            companyId: params.companyId,
+            environmentId: params.environmentId,
+            sandboxId: sandbox.id,
+            setupMarker,
+            expiresAt,
+            sourceTemplateRefRedacted: Boolean(params.sourceTemplateRef),
+          },
+        };
+      } catch (error) {
+        if (sandboxId) {
+          try { await client.destroySandbox(sandboxId); }
+          catch { throw new Error(`CreateOS interactive setup failed and cleanup is unconfirmed for sandbox ${sandboxId}.`); }
+        }
+        throw error;
+      }
+    },
+    async onEnvironmentGetInteractiveSetup(params) {
+      if (!params.providerLeaseId) return missingSetup();
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(config.timeoutMs);
+      try {
+        const sandbox = await client.getSandbox(params.providerLeaseId, signal);
+        if (["destroyed", "failed"].includes(sandbox.status!)) return missingSetup();
+        await client.transition(params.providerLeaseId, "running", signal);
+        const expiresAt = typeof params.setupMetadata.expiresAt === "string"
+          ? params.setupMetadata.expiresAt
+          : null;
+        return {
+          providerLeaseId: params.providerLeaseId,
+          status: "waiting_for_user",
+          expiresAt,
+          ...setupConnection(params.providerLeaseId, expiresAt, params.includeConnectionPayload === true),
+          metadata: params.setupMetadata,
+        };
+      } catch (error) {
+        if (error instanceof CreateosApiError && error.status === 404) return missingSetup();
+        throw error;
+      }
+    },
+    async onEnvironmentCaptureTemplate(params) {
+      if (!params.providerLeaseId) throw new Error("Cannot capture a CreateOS template without a setup sandbox lease.");
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const timeoutMs = params.timeoutMs ?? config.timeoutMs;
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) {
+        throw new Error("Invalid CreateOS template capture timeout.");
+      }
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(timeoutMs);
+      await verifyWorkspaceMarker(client, params.providerLeaseId, params.setupMetadata.setupMarker, signal);
+      // A paused CreateOS sandbox is the reusable source accepted by /fork.
+      // Do not delete it after promotion: this provider lease is the template.
+      await client.transition(params.providerLeaseId, "paused", signal);
+      return {
+        templateRef: params.providerLeaseId,
+        templateKind: "snapshot",
+        metadata: {
+          provider: "createos",
+          capturedAt: new Date().toISOString(),
+          sourceTemplateRefRedacted: Boolean(params.sourceTemplateRef),
+          previousTemplateRefRedacted: Boolean(params.previousTemplateRef),
+        },
+      };
+    },
+    async onEnvironmentCancelInteractiveSetup(params) {
+      if (!params.providerLeaseId) {
+        return { status: "missing", metadata: { provider: "createos", missing: true, reason: params.reason ?? null } };
+      }
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const client = new CreateosClient(config);
+      try {
+        await client.getSandbox(params.providerLeaseId, AbortSignal.timeout(config.timeoutMs));
+      } catch (error) {
+        if (error instanceof CreateosApiError && error.status === 404) {
+          return { status: "missing", metadata: { provider: "createos", missing: true, reason: params.reason ?? null } };
+        }
+        throw error;
+      }
+      await client.destroySandbox(params.providerLeaseId, AbortSignal.timeout(config.timeoutMs));
+      return {
+        status: params.reason === "timed_out" ? "timed_out" : "cancelled",
+        metadata: { provider: "createos", reason: params.reason ?? null },
+      };
+    },
+    async onEnvironmentDeleteTemplate(params) {
+      const templateKind = params.templateKind ?? "snapshot";
+      if (templateKind !== "snapshot") {
+        throw new Error(`CreateOS can delete snapshot templates only, not ${templateKind}.`);
+      }
+      const config = parseConfig(params.config);
+      await new CreateosClient(config).destroySandbox(params.templateRef, AbortSignal.timeout(config.timeoutMs));
+      return {
+        deleted: true,
+        metadata: {
+          provider: "createos",
+          templateKind: "snapshot",
+          templateRefRedacted: true,
+          reason: params.reason ?? null,
+        },
+      };
+    },
     async onEnvironmentExecute(params: PluginEnvironmentExecuteParams) {
       return track(params, (client, signal) => execute(client, params, signal,
-        (stream, text) => ctx?.execution.log(stream, text)), params.timeoutMs);
+        (stream, text) => ctx?.execution?.log(stream, text)), params.timeoutMs);
     },
     onEnvironmentSyncIn: (params) => track(params, (client, signal) => syncFiles(client, params, "in", signal)),
     onEnvironmentSyncOut: (params) => track(params, (client, signal) => syncFiles(client, params, "out", signal)),
+    async onLoginPtyOpen(params) {
+      ctx?.logger.info("CreateOS login PTY open requested.");
+      if (loginByRoute.has(params.hostRouteId)) throw new Error("CreateOS login route is already open.");
+      if (!/^\/tmp\/paperclip-adapter-login\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(params.sessionHome)) {
+        throw new Error("CreateOS login session home is invalid.");
+      }
+      const lease = resolveLease(params);
+      const client = new CreateosClient(lease.config);
+      const prepared = await client.json(`/sandboxes/${params.providerLeaseId}/exec`, "POST", {
+        cmd: "/bin/mkdir", args: ["-p", "--", params.sessionHome],
+      }, AbortSignal.timeout(lease.config.timeoutMs));
+      if (object(prepared.result).exit_code !== 0) throw new Error("CreateOS login home preparation failed.");
+      ctx?.logger.info("CreateOS login PTY home prepared.");
+      const commands = {
+        claude: ["claude", "setup-token"],
+        codex: ["codex", "login", "--device-auth"],
+        grok: ["grok", "login", "--device-auth"],
+      } as const;
+      const command = commands[params.loginCommandKey];
+      const loginEnv = [
+        `HOME=${shellQuote(params.sessionHome)}`,
+        `TERM=${shellQuote("xterm-256color")}`,
+        ...(params.loginCommandKey === "codex" ? [`CODEX_HOME=${shellQuote(params.sessionHome)}`] : []),
+        ...(params.loginCommandKey === "grok" ? [`GROK_HOME=${shellQuote(params.sessionHome)}`] : []),
+      ];
+      const script = loginScript(command, loginEnv);
+      const decoder = new StringDecoder("utf8");
+      const workerSessionId = `pty-${randomUUID()}`;
+      let session: ManagedProcessSession;
+      try {
+        session = await openManagedProcess(client, params.providerLeaseId, {
+          cmd: "/bin/bash", args: ["-lc", script], cwd: CWD,
+          pty: { cols: 120, rows: 30 },
+        }, "pty", (bytes) => ctx?.loginPty.output(params.hostRouteId, workerSessionId, decoder.write(Buffer.from(bytes))));
+      } catch (error) {
+        ctx?.logger.info(error instanceof CreateosApiError
+          ? `CreateOS login PTY process creation failed (HTTP ${error.status}).`
+          : "CreateOS login PTY process creation failed before binding.");
+        throw error;
+      }
+      ctx?.logger.info("CreateOS login PTY process opened.");
+      const entry: SessionEntry = { hostRouteId: params.hostRouteId, workerSessionId, providerLeaseId: params.providerLeaseId, session };
+      loginByRoute.set(params.hostRouteId, entry);
+      loginBySession.set(workerSessionId, entry);
+      void session.wait().then(
+        (result) => {
+          ctx?.logger.info(`CreateOS login PTY exited (code=${result.exitCode ?? "signal"}).`);
+          const tail = decoder.end();
+          if (tail) ctx?.loginPty.output(params.hostRouteId, workerSessionId, tail);
+          ctx?.loginPty.exit(params.hostRouteId, workerSessionId, result.exitCode);
+        },
+        () => {
+          ctx?.logger.info("CreateOS login PTY stream failed.");
+          const tail = decoder.end();
+          if (tail) ctx?.loginPty.output(params.hostRouteId, workerSessionId, tail);
+          ctx?.loginPty.exit(params.hostRouteId, workerSessionId, null);
+        },
+      ).finally(() => forget(entry, loginByRoute, loginBySession));
+      return { workerSessionId };
+    },
+    async onLoginPtyInput(params) {
+      await loginBySession.get(params.workerSessionId)?.session.write(Buffer.from(params.data));
+    },
+    async onLoginPtyStop(params) {
+      await loginBySession.get(params.workerSessionId)?.session.stop();
+    },
+    async onLoginPtyClose(params) {
+      const entry = loginByRoute.get(params.hostRouteId);
+      if (entry) {
+        await entry.session.close();
+        forget(entry, loginByRoute, loginBySession);
+      }
+      return { hostRouteId: params.hostRouteId };
+    },
+    async onDuplexChannelOpen(params) {
+      if (duplexByRoute.has(params.hostRouteId)) throw new Error("CreateOS duplex route is already open.");
+      if (!params.command.length || params.command.some((entry) => !entry || entry.includes("\0"))) {
+        throw new Error("CreateOS duplex command is invalid.");
+      }
+      const lease = resolveLease(params);
+      const client = new CreateosClient(lease.config);
+      const workerSessionId = `duplex-${randomUUID()}`;
+      const session = await openManagedProcess(client, params.providerLeaseId, {
+        cmd: params.command[0], args: params.command.slice(1), cwd: CWD,
+      }, "pipe", (bytes) => ctx?.duplexChannel.data(params.hostRouteId, workerSessionId, bytes));
+      const entry: SessionEntry = { hostRouteId: params.hostRouteId, workerSessionId, providerLeaseId: params.providerLeaseId, session };
+      duplexByRoute.set(params.hostRouteId, entry);
+      duplexBySession.set(workerSessionId, entry);
+      void session.wait().then(
+        (result) => ctx?.duplexChannel.exit(params.hostRouteId, workerSessionId, result.exitCode),
+        () => ctx?.duplexChannel.exit(params.hostRouteId, workerSessionId, null),
+      ).finally(() => forget(entry, duplexByRoute, duplexBySession));
+      return { hostRouteId: params.hostRouteId, workerSessionId };
+    },
+    async onDuplexChannelWrite(params) {
+      const entry = duplexBySession.get(params.workerSessionId);
+      if (!entry || entry.hostRouteId !== params.hostRouteId) return;
+      const bytes = decodeChannelBytes(params.data);
+      if (bytes) await entry.session.write(bytes);
+    },
+    async onDuplexChannelStop(params) {
+      const entry = duplexBySession.get(params.workerSessionId);
+      if (entry?.hostRouteId === params.hostRouteId) await entry.session.stop();
+    },
+    async onDuplexChannelClose(params) {
+      const entry = duplexByRoute.get(params.hostRouteId);
+      if (!entry) return { hostRouteId: params.hostRouteId };
+      await entry.session.close();
+      forget(entry, duplexByRoute, duplexBySession);
+      return { hostRouteId: params.hostRouteId, workerSessionId: entry.workerSessionId };
+    },
     async onShutdown() {
       shuttingDown = true;
+      const sessions = [...loginByRoute.values(), ...duplexByRoute.values()];
+      loginByRoute.clear(); loginBySession.clear(); duplexByRoute.clear(); duplexBySession.clear();
+      await Promise.all(sessions.map((entry) => entry.session.close().catch(() => undefined)));
       await Promise.all([...active.keys()].map(stopActive));
+      leases.clear();
       ctx = null;
     },
   });

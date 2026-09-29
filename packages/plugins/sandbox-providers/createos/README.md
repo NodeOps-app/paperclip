@@ -59,58 +59,117 @@ has no custom UI. Required fields:
 
 Optional fields:
 
-- `rootfs`: a rootfs catalog entry or a ready template ID/name; omission uses
-  the provider default. The image must include `/bin/bash`, ordinary Unix
+- `snapshot`: a paused CreateOS sandbox ID captured through Paperclip's custom
+  image setup flow. New leases fork this sandbox instead of creating from
+  `rootfs`. Paperclip manages this field when a captured template is activated.
+- `rootfs`: a rootfs catalog entry or a ready template ID/name; omission asks
+  the provider's `/rootfs` catalog for its current recommended default. The image must include `/bin/bash`, ordinary Unix
   utilities including `tar`, `base64`, and GNU `realpath` (`-m` support), and the selected adapter's runtime
   dependencies (such as Node and Git). The generic runtime provisions/stages
   agent assets; this plugin does not build an agent image.
+- `rootfsByAdapter`: optional adapter-to-rootfs map. For each newly acquired
+  lease, `rootfsByAdapter[adapterType]` overrides `rootfs`; changing the
+  effective image expires a reusable lease before any provider API call.
+- `egressAllowlist`: base list of allowed FQDNs and CIDRs. Paperclip merges it
+  with the run's `networkEgress.allowFqdns` and `allowCidrs`. Missing, empty,
+  `null`, and `["*"]` use CreateOS allow-all semantics; a non-empty restrictive
+  list is deny-by-default. A wildcard is removed when restrictive entries are
+  also present. There is no synthetic deny-all rule.
 - `region`: must match the API endpoint. Omission uses the provider default.
 - `timeoutMs`: operation/default command deadline, 300000 ms by default. This
   is **not** a sandbox TTL.
-- `reuseLease`: default false. False deletes on release; true waits for pause
-  completion and later resumes the same sandbox, preserving workspace data.
+- `reuseLease`: default false. False deletes on release. True leaves the sandbox
+  warm after release and later reuses the same sandbox, preserving workspace data.
+- `autoPauseAfterSeconds`: for reusable leases, the CreateOS-native inactivity
+  window before the warm sandbox pauses. Defaults to 600 seconds; valid values
+  are 60–86400. Paperclip resumes an auto-paused sandbox on the next run. This
+  is an idle-cost control, not a guaranteed sandbox expiry.
 
-The probe creates a sandbox, prepares its workspace, executes a managed
+The probe creates a sandbox, prepares its workspace, executes a streaming
 command, and deletes the sandbox. It therefore uses real provider resources.
 
 ## Implemented behavior
 
 - Company/environment-bound lease metadata and a random workspace marker
   checked before a resumed lease is trusted. API keys are not lease metadata.
-- State-aware pause/resume with bounded polling. Transient errors are surfaced;
-  only missing/terminal sandboxes or a mismatched workspace expire a resume.
-- Managed pipe processes with explicit working directory, quoted arguments,
-  per-command environment, staged stdin, and separate stdout/stderr.
+- Provider-native idle pause for reusable leases. Paperclip leaves a released
+  sandbox warm, then accepts either `running` or auto-paused state on the next
+  resume. Transient errors are surfaced; only missing/terminal sandboxes or a
+  mismatched workspace expire a resume.
+- Custom-image setup through a CreateOS CLI command. Paperclip creates a setup
+  sandbox with auto-pause disabled and shows `createos sandbox shell <id>`.
+  Clicking **Finished** verifies the workspace marker and pauses that sandbox;
+  its ID becomes the active template. Normal leases fork the paused template,
+  so setup state is copied without running jobs in the golden sandbox. Editing
+  an active template forks it first, and cancelling deletes only the temporary
+  setup sandbox.
+- Creation-time egress policy and live egress replacement before a reusable
+  sandbox resumes. The base policy, effective per-run policy, adapter, and
+  effective rootfs are recorded without credentials in lease metadata.
+- Ordinary commands use CreateOS's streaming `/exec` endpoint with an explicit
+  working directory, quoted arguments, per-command environment, atomic stdin,
+  and separate stdout/stderr.
   Per-command variables are applied by the command wrapper; CreateOS's API-level
   environment overrides only accept keys declared at sandbox creation.
-- Incremental output via replayable NDJSON, bounded reconnect attempts, UTF-8
-  decoding across frame boundaries, and explicit errors for missing output.
+- Incremental NDJSON output with UTF-8 decoding across frame boundaries and
+  explicit errors for malformed or failed execution frames.
   Returned stdout/stderr each retain at most 4 Mi characters of tail output;
   `metadata.outputTruncated` reports truncation. Live log chunks are still
-  delivered as they arrive.
+  delivered as they arrive. PTY and duplex sessions continue to use managed
+  processes, including replayable output when those sessions reconnect.
 - API requests to each endpoint are spaced by at least 300 ms across this
   worker's leases, keeping callback polling below the provider's 300/minute
   IP limit. Other workers or applications sharing the same IP can still
   exhaust that shared limit.
-- Command timeout and active lease-release/shutdown cancellation explicitly
-  terminate the process tree. Disconnecting the stream alone is not cancellation.
-  Unknown process-creation outcomes and failed process cleanup prevent reuse
-  in the current worker; the operator/host must destroy the affected lease.
-  No automatic retry of process creation or command execution occurs.
+- Command timeout and active lease-release/shutdown cancellation abort the
+  streaming request. Managed PTY and duplex cleanup explicitly terminates the
+  process tree; failed managed-process cleanup prevents reuse in the current
+  worker, and the operator/host must destroy the affected lease. No automatic
+  retry of command execution occurs.
 - Workspace realization at `/paperclip-workspace` and native binary file sync,
   including directory archives, file modes, exclusions, symlink containment,
   atomic file downloads, and ordered post-upload commands. This keeps bulk data
   out of CreateOS's 1 MiB managed-process output journal. Ordinary command
-  output still uses that journal and fails explicitly if unread data is evicted.
+  output uses the streaming exec path and therefore does not depend on replaying
+  that journal.
   Outbound archives are validated before extraction and limited to 10 GiB of
   declared file data; absolute/traversing paths and escaping links are rejected.
+- Concurrent inbound/outbound sync. Every call owns random sandbox scratch
+  paths and independent host temporary directories; teardown waits for all
+  active calls.
+- Interactive setup-token login PTYs for Claude, Codex, and Grok. The command
+  is selected from a closed key set, the host-controlled session home is
+  revalidated, and asdf-backed executables are resolved before switching to
+  that isolated home, with their runtime bin directory placed first on PATH.
+  The CreateOS PTY starts at 120 columns by 30 rows. The
+  current Paperclip login hook has no resize method, so live PTY resize is not
+  advertised or emulated.
+- Persistent duplex command channels over CreateOS pipe processes. Binary
+  input is decoded from the plugin wire format, serialized and split into
+  provider-safe 256 KiB writes; stdout is forwarded as raw bytes. Stop and
+  release send SIGTERM and require a whole-tree deletion receipt.
 
 ## Capability boundaries
 
-Interactive login PTYs, temporary login leases, snapshot capture,
-duplex channels, and provider WebSocket ingress are not advertised.
-CreateOS idle auto-pause is not a guaranteed absolute expiry, so acquisition
-with `requestedExpiresAt` fails before provisioning a resource.
+Temporary login leases, dynamic login PTY resize, and provider WebSocket
+ingress are not advertised. Login PTYs and duplex command
+channels require a lease acquired or resumed by the current worker; after a
+worker restart they fail closed until the host restores that lease.
+Paperclip's Claude setup-token flow additionally requires a provider-attested
+absolute lease expiry. CreateOS has no hard TTL, and provider-native idle pause
+does not satisfy that guarantee, so this plugin continues to reject
+`requestedExpiresAt`; therefore that bounded setup-token flow remains
+unavailable. The PTY hooks are
+usable by login/session flows that do not request a guaranteed expiry.
+Acquisition with `requestedExpiresAt` fails before provisioning a resource.
+
+CreateOS's SSH gateway supports TCP forwarding but not the shell session
+required by Paperclip's embedded browser terminal. Interactive custom-image
+setup therefore requires the `createos` CLI to be installed and logged into the
+same CreateOS account as the environment API key. The setup command contains no
+API key. Anything installed or stored inside the setup sandbox is captured in
+the template, including credentials; remove secrets before clicking
+**Finished**.
 
 The host has an outbound-WSS native runner path for providers without ingress.
 Using it additionally requires a reachable Paperclip runner endpoint and the
@@ -133,9 +192,18 @@ and optionally `CREATEOS_ROOTFS`, then run:
 CREATEOS_LIVE_TEST=1 pnpm test
 ```
 
-The live test creates a sandbox, round-trips a 5 MiB binary file through native
-sync, checks stdin/env/output, writes a file, pauses
-and resumes the sandbox, verifies the file, and deletes it in `finally`.
+The live test creates a sandbox, overlaps native sync-in and sync-out while
+round-tripping a 5 MiB binary file, checks stdin/env/output, optional
+`CREATEOS_EGRESS_ALLOWLIST` enforcement (when it includes `github.com`, the
+test proves GitHub is reachable and `example.com` is blocked), a duplex
+echo/stop/close cycle, and
+a 120×30 PTY `stty size` result, writes a file, releases and resumes the warm
+sandbox after proving it auto-paused, verifies the file, and deletes it in
+`finally`. A separate live case proves a non-reusable lease is deleted on
+release.
+It also creates an interactive setup sandbox, writes a proof file, captures it
+by pausing, acquires a fork from that template, verifies the proof file, and
+deletes both fork and template.
 It does not print credentials. Cleanup errors fail the test.
 
 ## Optional managed-image inclusion

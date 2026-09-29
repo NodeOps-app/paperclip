@@ -2,11 +2,17 @@ export interface CreateosConfig {
   apiUrl: string;
   apiKey: string | null;
   shape: string;
+  snapshot: string | null;
   rootfs: string | null;
+  rootfsByAdapter: Record<string, string>;
+  egressAllowlist: string[];
   region: string | null;
   timeoutMs: number;
   reuseLease: boolean;
+  autoPauseAfterSeconds: number;
 }
+
+export const DEFAULT_AUTO_PAUSE_AFTER_SECONDS = 600;
 
 export function parseConfig(raw: Record<string, unknown>): CreateosConfig {
   const text = (key: string): string | null => {
@@ -38,15 +44,71 @@ export function parseConfig(raw: Record<string, unknown>): CreateosConfig {
   if (raw.reuseLease != null && typeof raw.reuseLease !== "boolean") {
     throw new Error("reuseLease must be a boolean.");
   }
+  const autoPauseAfterSeconds = raw.autoPauseAfterSeconds ?? DEFAULT_AUTO_PAUSE_AFTER_SECONDS;
+  if (typeof autoPauseAfterSeconds !== "number" || !Number.isInteger(autoPauseAfterSeconds) ||
+      autoPauseAfterSeconds < 60 || autoPauseAfterSeconds > 86_400) {
+    throw new Error("autoPauseAfterSeconds must be an integer between 60 and 86400.");
+  }
+  const rootfsByAdapter: Record<string, string> = {};
+  if (raw.rootfsByAdapter != null) {
+    if (typeof raw.rootfsByAdapter !== "object" || Array.isArray(raw.rootfsByAdapter)) {
+      throw new Error("rootfsByAdapter must be an object of adapter names to root filesystems.");
+    }
+    for (const [adapter, rootfs] of Object.entries(raw.rootfsByAdapter as Record<string, unknown>)) {
+      const key = adapter.trim();
+      if (!key || /[\0\r\n]/.test(key) || typeof rootfs !== "string" || !rootfs.trim() || /[\0\r\n]/.test(rootfs)) {
+        throw new Error("rootfsByAdapter must contain non-empty adapter and root filesystem strings.");
+      }
+      rootfsByAdapter[key] = rootfs.trim();
+    }
+  }
+  let egressAllowlist: string[] = [];
+  if (raw.egressAllowlist != null) {
+    if (!Array.isArray(raw.egressAllowlist) || raw.egressAllowlist.some((entry) => typeof entry !== "string" || !entry.trim() || /[\0\r\n]/.test(entry))) {
+      throw new Error("egressAllowlist must be an array of non-empty host or CIDR strings.");
+    }
+    egressAllowlist = [...new Set(raw.egressAllowlist.map((entry) => entry.trim()))];
+  }
   return {
     apiUrl: url.origin,
     apiKey: text("apiKey"),
     shape,
+    snapshot: text("snapshot"),
     rootfs: text("rootfs"),
+    rootfsByAdapter,
+    egressAllowlist,
     region: text("region"),
     timeoutMs,
     reuseLease: raw.reuseLease === true,
+    autoPauseAfterSeconds,
   };
+}
+
+export function resolveRootfs(config: CreateosConfig, adapterType?: string): string | null {
+  return (adapterType ? config.rootfsByAdapter[adapterType] : undefined) ?? config.rootfs;
+}
+
+function stringList(value: unknown): string[] {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim() || /[\0\r\n]/.test(entry))) {
+    throw new Error("networkEgress allowlists must contain non-empty strings.");
+  }
+  return value.map((entry) => entry.trim());
+}
+
+export function resolveEgressAllowlist(
+  config: CreateosConfig,
+  settings?: Record<string, unknown> | null,
+): string[] {
+  const network = settings?.networkEgress;
+  if (network != null && (typeof network !== "object" || Array.isArray(network))) {
+    throw new Error("networkEgress must be an object.");
+  }
+  const record = (network ?? {}) as Record<string, unknown>;
+  const merged = [...config.egressAllowlist, ...stringList(record.allowFqdns), ...stringList(record.allowCidrs)];
+  const unique = [...new Set(merged)];
+  if (unique.length > 1) return unique.filter((entry) => entry !== "*");
+  return unique;
 }
 
 export function resolveApiKey(config: CreateosConfig): string {

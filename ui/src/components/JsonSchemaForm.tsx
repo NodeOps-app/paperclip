@@ -846,6 +846,7 @@ const StringField = React.memo(({
   description,
   error,
   defaultValue,
+  placeholder,
   format,
   maxLength,
 }: {
@@ -857,6 +858,7 @@ const StringField = React.memo(({
   description?: string;
   error?: string;
   defaultValue?: unknown;
+  placeholder?: unknown;
   format?: string;
   maxLength?: number;
 }) => {
@@ -875,7 +877,7 @@ const StringField = React.memo(({
           aria-required={isRequired}
           value={String(value ?? "")}
           onChange={(e) => onChange(e.target.value)}
-          placeholder={String(defaultValue ?? "")}
+          placeholder={String(placeholder ?? defaultValue ?? "")}
           disabled={disabled}
           className="min-h-(--sz-100px)"
           aria-invalid={!!error}
@@ -887,7 +889,7 @@ const StringField = React.memo(({
           type="text"
           value={String(value ?? "")}
           onChange={(e) => onChange(e.target.value)}
-          placeholder={String(defaultValue ?? "")}
+          placeholder={String(placeholder ?? defaultValue ?? "")}
           disabled={disabled}
           aria-invalid={!!error}
         />
@@ -1233,6 +1235,7 @@ const FormField = React.memo(({
           description={propSchema.description}
           error={error}
           defaultValue={propSchema.default}
+          placeholder={Array.isArray(propSchema.examples) ? propSchema.examples[0] : undefined}
           format={propSchema.format}
           maxLength={propSchema.maxLength}
         />

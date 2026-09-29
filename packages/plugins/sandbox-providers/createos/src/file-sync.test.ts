@@ -8,7 +8,7 @@ import { parseConfig } from "./config.js";
 import { assertRemotePath, syncFiles, validateArchive } from "./file-sync.js";
 
 const run = vi.hoisted(() => vi.fn());
-vi.mock("./execute.js", async (original) => ({ ...await original<typeof import("./execute.js")>(), execute: run }));
+vi.mock("./execute.js", async (original) => ({ ...await original<typeof import("./execute.js")>(), executeStream: run }));
 
 const config = { apiUrl: "https://createos.example.test", apiKey: "secret", shape: "test", timeoutMs: 5000 };
 const client = () => new CreateosClient(parseConfig(config));
@@ -124,6 +124,34 @@ it("runs post-upload commands verbatim and stops after the first failure", async
   const commands = run.mock.calls.map((call) => call[1].args[1]);
   expect(commands).toContain(command);
   expect(commands).not.toContain("must-not-run");
+});
+
+it("keeps concurrent sync calls isolated and actually overlaps their work", async () => {
+  let active = 0;
+  let maximum = 0;
+  let arrivals = 0;
+  let release!: () => void;
+  const bothRunning = new Promise<void>((resolve) => { release = resolve; });
+  run.mockImplementation(async () => {
+    active++;
+    maximum = Math.max(maximum, active);
+    arrivals++;
+    if (arrivals === 2) release();
+    await bothRunning;
+    active--;
+    return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+  });
+  const operation = (id: string) => ({
+    ...params,
+    operations: [{ operationId: id, files: [], postUploadCommands: [{ command: `echo ${id}` }] }],
+  });
+  const [first, second] = await Promise.all([
+    syncFiles(client(), operation("first"), "in", AbortSignal.timeout(5000)),
+    syncFiles(client(), operation("second"), "in", AbortSignal.timeout(5000)),
+  ]);
+  expect(maximum).toBeGreaterThanOrEqual(2);
+  expect(first.operations[0].operationId).toBe("first");
+  expect(second.operations[0].operationId).toBe("second");
 });
 
 it.each(["/etc/passwd", "/paperclip-workspace/../secret", "relative", "/paperclip-workspace-other/file"])("rejects unconfined sandbox path %s before any API call", async (sourcePath) => {

@@ -62,7 +62,7 @@ export class CreateosClient {
         : path.includes("/connect?") ? "output connection"
         : path.endsWith("/processes") ? "process creation"
         : path.includes("/processes/") ? "process cleanup"
-        : path.endsWith("/exec") ? "workspace command"
+        : path.includes("/exec") ? "workspace command"
         : "sandbox lifecycle";
       throw new CreateosApiError(response.status, operation);
     }
@@ -87,22 +87,92 @@ export class CreateosClient {
     return { id, status: data.status };
   }
 
-  async createSandbox(signal: AbortSignal): Promise<Sandbox> {
-    const { shape, rootfs, region } = this.config;
+  async createSandbox(signal: AbortSignal, options: {
+    rootfs: string | null;
+    egress: string[];
+    autoPauseAfterSeconds: number | null;
+  }): Promise<Sandbox> {
+    const { shape, region } = this.config;
+    const { rootfs, egress, autoPauseAfterSeconds } = options;
     const data = await this.json("/sandboxes", "POST", {
       shape,
       ...(rootfs ? { rootfs } : {}),
       ...(region ? { region } : {}),
+      ...(egress.length ? { egress } : {}),
+      ...(autoPauseAfterSeconds != null ? { auto_pause_after_seconds: autoPauseAfterSeconds } : {}),
       ingress_enabled: false,
-      // The host owns lease release. Idle pause is not a command timeout or a
-      // guaranteed expiry, and could suspend a quiet active agent.
+      // CreateOS owns the idle timer. Paperclip still owns explicit destruction
+      // and treats auto-pause as reuse optimization, never guaranteed expiry.
     }, signal);
     return { id: identifier(data.id) };
   }
 
-  async destroySandbox(id: string): Promise<void> {
-    try { await this.json(`/sandboxes/${identifier(id)}`, "DELETE"); }
+  async resolveRootfs(rootfs: string | null, signal: AbortSignal): Promise<string> {
+    if (rootfs) return rootfs;
+    const data = await this.json("/rootfs", "GET", undefined, signal);
+    if (typeof data.default !== "string" || !data.default.trim() || /[\0\r\n]/.test(data.default)) {
+      throw new Error("CreateOS rootfs catalog did not provide a valid default.");
+    }
+    return data.default.trim();
+  }
+
+  async setEgress(id: string, egress: string[], signal: AbortSignal): Promise<void> {
+    await this.json(`/sandboxes/${identifier(id)}/egress`, "PUT", { egress }, signal);
+  }
+
+  async destroySandbox(id: string, signal?: AbortSignal): Promise<void> {
+    try { await this.json(`/sandboxes/${identifier(id)}`, "DELETE", undefined, signal); }
     catch (error) { if (!(error instanceof CreateosApiError && error.status === 404)) throw error; }
+  }
+
+  async setAutoPause(id: string, seconds: number | null, signal: AbortSignal): Promise<void> {
+    await this.json(`/sandboxes/${identifier(id)}`, "PATCH", seconds == null
+      ? { disable_auto_pause: true }
+      : { auto_pause_after_seconds: seconds }, signal);
+  }
+
+  async forkSandbox(sourceId: string, signal: AbortSignal, options: {
+    egress: string[];
+    autoPauseAfterSeconds: number | null;
+  }): Promise<Sandbox> {
+    const source = await this.getSandbox(sourceId, signal);
+    if (source.status !== "paused") {
+      throw new Error("CreateOS template sandbox must be paused before it can be forked.");
+    }
+
+    let data: Record<string, unknown>;
+    let forkConflicts = 0;
+    for (;;) {
+      signal.throwIfAborted();
+      try {
+        data = await this.json(`/sandboxes/${identifier(sourceId)}/fork`, "POST", {
+          start_paused: false,
+          // An empty CreateOS egress list means allow-all, but /fork inherits
+          // the source list when the field is omitted or empty. Send the
+          // provider's explicit allow-all spelling so a newly relaxed policy
+          // does not inherit a captured restrictive list.
+          egress: options.egress.length > 0 ? options.egress : ["*"],
+          ingress_enabled: false,
+        }, signal);
+        break;
+      } catch (error) {
+        // A sandbox can report paused just before its bundle upload becomes
+        // forkable. CreateOS reports that short durability window as 409.
+        if (!(error instanceof CreateosApiError && error.status === 409) || ++forkConflicts > 40) throw error;
+        await delay(250, undefined, { signal });
+      }
+    }
+
+    const id = identifier(data.id);
+    try {
+      await this.transition(id, "running", signal);
+      await this.setAutoPause(id, options.autoPauseAfterSeconds, signal);
+      return { id, status: "running" };
+    } catch (error) {
+      try { await this.destroySandbox(id); }
+      catch { throw new Error(`CreateOS fork setup failed and cleanup is unconfirmed for sandbox ${id}.`); }
+      throw error;
+    }
   }
 
   async transition(id: string, desired: "running" | "paused", signal: AbortSignal): Promise<void> {
@@ -122,8 +192,8 @@ export class CreateosClient {
           // A concurrent state transition is reconciled by reading its state.
           if (!(error instanceof CreateosApiError && error.status === 409)) throw error;
         }
-      } else if (!canSubmit && !["creating", "pausing", "resuming"].includes(sandbox.status!)) {
-        throw new Error(`CreateOS sandbox did not reach ${desired}.`);
+      } else if (!canSubmit && !["creating", "pausing", "resuming", "forking"].includes(sandbox.status!)) {
+        throw new Error(`CreateOS sandbox did not reach ${desired}; provider state is ${sandbox.status}.`);
       }
       // An accepted transition can remain in its previous state briefly.
       // Poll under the same deadline without submitting the action twice.
