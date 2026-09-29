@@ -1244,6 +1244,49 @@ describe("CompanyEnvironments — test provider button", () => {
     expect(findButton(dialog, "Cancel")?.disabled).toBe(false);
   });
 
+  it("shows a provider setup command without trying to open the SSH browser terminal", async () => {
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const command = "createos sandbox shell sb_setup";
+    mockEnvironmentsApi.list.mockResolvedValue([
+      { id: "env-1", name: "CreateOS", driver: "sandbox", description: null, config: { provider: "createos" } },
+    ]);
+    const capabilities = supportedDaytonaCapabilities();
+    mockEnvironmentsApi.capabilities.mockResolvedValue({
+      ...capabilities,
+      sandboxProviders: {
+        createos: {
+          ...capabilities.sandboxProviders.daytona,
+          displayName: "CreateOS",
+          interactiveSetupConnectionTypes: ["createos_cli"],
+        },
+      },
+    });
+    mockEnvironmentsApi.customImageTemplate.mockResolvedValue({
+      activeTemplate: null,
+      activeSession: createSession(),
+      latestSession: createSession(),
+    });
+    mockEnvironmentsApi.customImageSetupSession.mockResolvedValue({
+      session: createSession(),
+      connectionPayload: { type: "createos_cli", command },
+    });
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+    await openEnvironmentEditPage(container);
+
+    await waitForAssertion(() => {
+      expect(getEnvironmentFormPage()?.textContent).toContain(command);
+      expect(getEnvironmentFormPage()?.textContent).toContain("Setup command");
+      expect(getEnvironmentFormPage()?.textContent).not.toContain("SSH command fallback");
+    });
+    expect(mockEnvironmentsApi.createCustomImageTerminalSessionToken).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
   it("shows active template controls for refresh, rollback, and disable", async () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

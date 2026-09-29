@@ -8,7 +8,7 @@ import { parseConfig } from "./config.js";
 import { assertRemotePath, syncFiles, validateArchive } from "./file-sync.js";
 
 const run = vi.hoisted(() => vi.fn());
-vi.mock("./execute.js", async (original) => ({ ...await original<typeof import("./execute.js")>(), execute: run }));
+vi.mock("./execute.js", async (original) => ({ ...await original<typeof import("./execute.js")>(), executeStream: run }));
 
 const config = { apiUrl: "https://createos.example.test", apiKey: "secret", shape: "test", timeoutMs: 5000 };
 const client = () => new CreateosClient(parseConfig(config));

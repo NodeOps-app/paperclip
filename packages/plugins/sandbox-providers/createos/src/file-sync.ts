@@ -7,7 +7,7 @@ import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
 import type { PluginEnvironmentSyncInParams, PluginEnvironmentSyncResult } from "@paperclipai/plugin-sdk";
 import { CreateosClient, identifier } from "./client.js";
-import { execute, shellQuote } from "./execute.js";
+import { executeStream as execute, shellQuote } from "./execute.js";
 
 const ROOT = "/paperclip-workspace";
 

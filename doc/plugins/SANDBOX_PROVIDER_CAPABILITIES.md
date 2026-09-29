@@ -10,6 +10,24 @@ Read [Sandbox file-sync lifecycle hooks](./SANDBOX_FILE_SYNC_HOOKS.md) for the
 native file-transfer hooks. Read the driver declaration shape in
 [the plugin specification](./PLUGIN_SPEC.md).
 
+## Interactive setup and captured templates
+
+Custom-image setup is declared separately from runtime sandbox capabilities.
+A provider that implements the five interactive setup/template hooks declares
+`supportsInteractiveSetup`, `supportsTemplateCapture`, and, when cleanup is
+available, `supportsTemplateDelete`. It also declares its connection types,
+template reference kind, config binding, and identity paths. The host persists
+only the redacted connection summary; it requests a connection payload when an
+authorized operator opens the setup UI.
+
+CreateOS uses `createos_cli` rather than `ssh`: its gateway does not provide the
+shell session required by the host's embedded SSH terminal. The worker returns
+`createos sandbox shell <id>`, pauses the completed setup sandbox, and binds its
+ID to the environment's `snapshot` field. Each runtime lease forks that paused
+sandbox. Editing a template forks the current template first, while cancel and
+template deletion remove the corresponding CreateOS sandbox. The CLI must be
+authenticated to the same CreateOS account as the environment credential.
+
 ## Fresh lease acquisition timeout
 
 A driver can declare `defaultAcquireTimeoutMs` as a positive integer of at most

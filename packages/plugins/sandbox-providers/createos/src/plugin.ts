@@ -4,10 +4,11 @@ import { decodeChannelBytes, definePlugin } from "@paperclipai/plugin-sdk";
 import type {
   PluginContext, PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDriverBaseParams,
   PluginEnvironmentExecuteParams, PluginEnvironmentLease, PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentInteractiveSetupSession,
 } from "@paperclipai/plugin-sdk";
 import { CreateosApiError, CreateosClient, object } from "./client.js";
 import { parseConfig, resolveApiKey, resolveEgressAllowlist, resolveRootfs, type CreateosConfig } from "./config.js";
-import { CreateosCleanupError, execute, shellQuote } from "./execute.js";
+import { executeStream as execute, shellQuote } from "./execute.js";
 import { syncFiles } from "./file-sync.js";
 import { openManagedProcess, type ManagedProcessSession } from "./process-session.js";
 
@@ -37,39 +38,115 @@ function metadataMatches(params: PluginEnvironmentDriverBaseParams, metadata?: R
     metadata.environmentId === params.environmentId && metadata.apiUrl === parseConfig(params.config).apiUrl;
 }
 
+function setupMetadataMatches(
+  params: PluginEnvironmentDriverBaseParams,
+  providerLeaseId: string,
+  metadata?: Record<string, unknown>,
+): metadata is Record<string, unknown> & { setupMarker: string } {
+  return metadataMatches(params, metadata) && metadata?.sandboxId === providerLeaseId &&
+    typeof metadata.setupMarker === "string" && /^[0-9a-f-]{36}$/.test(metadata.setupMarker);
+}
+
+function setupConnection(
+  providerLeaseId: string,
+  expiresAt: string | null,
+  includePayload: boolean,
+): Pick<PluginEnvironmentInteractiveSetupSession, "connectionSummary" | "connectionPayload"> {
+  return {
+    connectionSummary: {
+      type: "createos_cli",
+      hostRedacted: true,
+      portRedacted: true,
+      commandRedacted: !includePayload,
+      expiresAt,
+      metadata: { provider: "createos" },
+    },
+    connectionPayload: includePayload ? {
+      type: "createos_cli",
+      command: `createos sandbox shell ${providerLeaseId}`,
+      expiresAt,
+      metadata: { provider: "createos" },
+    } : null,
+  };
+}
+
+function missingSetup(): PluginEnvironmentInteractiveSetupSession {
+  return {
+    providerLeaseId: null,
+    status: "missing",
+    connectionSummary: null,
+    connectionPayload: null,
+    metadata: { provider: "createos", missing: true },
+  };
+}
+
+async function prepareWorkspace(
+  client: CreateosClient,
+  sandboxId: string,
+  marker: string,
+  signal: AbortSignal,
+): Promise<void> {
+  await client.transition(sandboxId, "running", signal);
+  const data = await client.json(`/sandboxes/${sandboxId}/exec`, "POST", {
+    cmd: "/bin/bash", args: ["-lc", `mkdir -p -- ${shellQuote(CWD)}`],
+  }, signal);
+  if (object(data.result).exit_code !== 0) {
+    throw new Error("CreateOS workspace preparation failed; the image must provide Bash.");
+  }
+  await client.upload(sandboxId, MARKER, marker, signal);
+}
+
+async function verifyWorkspaceMarker(
+  client: CreateosClient,
+  sandboxId: string,
+  marker: string,
+  signal: AbortSignal,
+): Promise<void> {
+  await client.transition(sandboxId, "running", signal);
+  const data = await client.json(`/sandboxes/${sandboxId}/exec`, "POST", {
+    cmd: "/bin/cat", args: [MARKER],
+  }, signal);
+  const result = object(data.result);
+  if (result.exit_code !== 0 || result.stdout !== marker) {
+    throw new Error("CreateOS setup sandbox identity could not be verified.");
+  }
+}
+
 async function acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
   // An idle timeout or a host-local timer cannot supply a provider expiry.
   if (params.requestedExpiresAt) throw new Error("CreateOS does not yet support leases with a guaranteed expiration deadline.");
   const config = parseConfig(params.config);
   const client = new CreateosClient(config);
   const signal = AbortSignal.timeout(config.timeoutMs);
-  const effectiveRootfs = resolveRootfs(config, params.adapterType);
+  const requestedRootfs = resolveRootfs(config, params.adapterType);
+  const effectiveRootfs = config.snapshot ? null : await client.resolveRootfs(requestedRootfs, signal);
   const effectiveEgress = resolveEgressAllowlist(config, params.executionWorkspaceSettings);
   // Login leases deliberately carry no issue or execution workspace. They are
   // always disposable even when the environment enables reuse.
   const effectiveAutoPause = config.reuseLease && (params.issueId || params.executionWorkspaceId)
     ? config.autoPauseAfterSeconds
     : null;
-  const sandbox = await client.createSandbox(signal, {
-    rootfs: effectiveRootfs,
-    egress: effectiveEgress,
-    autoPauseAfterSeconds: effectiveAutoPause,
-  });
+  const sandbox = config.snapshot
+    ? await client.forkSandbox(config.snapshot, signal, {
+        egress: effectiveEgress,
+        autoPauseAfterSeconds: effectiveAutoPause,
+      })
+    : await client.createSandbox(signal, {
+        rootfs: effectiveRootfs,
+        egress: effectiveEgress,
+        autoPauseAfterSeconds: effectiveAutoPause,
+      });
   try {
-    await client.transition(sandbox.id, "running", signal);
-    const data = await client.json(`/sandboxes/${sandbox.id}/exec`, "POST", {
-      cmd: "/bin/bash", args: ["-lc", `mkdir -p -- ${shellQuote(CWD)}`],
-    }, signal);
-    if (object(data.result).exit_code !== 0) throw new Error("CreateOS workspace preparation failed; the image must provide Bash.");
     const marker = randomUUID();
-    await client.upload(sandbox.id, MARKER, marker, signal);
+    await prepareWorkspace(client, sandbox.id, marker, signal);
     return {
       providerLeaseId: sandbox.id,
       metadata: {
         provider: "createos", apiUrl: config.apiUrl,
         companyId: params.companyId, environmentId: params.environmentId,
         remoteCwd: CWD, shellCommand: "bash", marker,
-        shape: config.shape, rootfs: effectiveRootfs, adapterType: params.adapterType ?? null,
+        shape: config.shape, snapshot: config.snapshot, rootfs: effectiveRootfs, requestedRootfs,
+        adapterType: params.adapterType ?? null,
         region: config.region, baseEgressAllowlist: config.egressAllowlist,
         effectiveEgressAllowlist: effectiveEgress,
         reuseLease: config.reuseLease,
@@ -166,9 +243,6 @@ export function createPlugin() {
     active.set(scope, calls);
     try {
       return await work(new CreateosClient(config), AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]));
-    } catch (error) {
-      if (error instanceof CreateosCleanupError) unconfirmedCleanup.add(scope);
-      throw error;
     } finally {
       calls.delete(entry);
       if (calls.size === 0) active.delete(scope);
@@ -247,7 +321,8 @@ export function createPlugin() {
       const configuredEgress = Array.isArray(params.leaseMetadata?.baseEgressAllowlist)
         ? params.leaseMetadata.baseEgressAllowlist : [];
       if (params.leaseMetadata?.shape !== config.shape ||
-          params.leaseMetadata.rootfs !== resolveRootfs(config, adapterType) ||
+          params.leaseMetadata.snapshot !== config.snapshot ||
+          params.leaseMetadata.requestedRootfs !== resolveRootfs(config, adapterType) ||
           params.leaseMetadata.region !== config.region ||
           params.leaseMetadata.autoPauseAfterSeconds !== (config.reuseLease ? config.autoPauseAfterSeconds : null) ||
           JSON.stringify(configuredEgress) !== JSON.stringify(config.egressAllowlist)) {
@@ -284,9 +359,153 @@ export function createPlugin() {
       // The runtime's source mappings stage into this provider workspace.
       return { cwd: CWD, metadata: { provider: "createos", remoteCwd: CWD } };
     },
+    async onEnvironmentStartInteractiveSetup(params) {
+      const config = parseConfig(params.config);
+      if (params.sourceTemplateRef && params.sourceTemplateKind && params.sourceTemplateKind !== "snapshot") {
+        throw new Error(`CreateOS can start from snapshot templates only, not ${params.sourceTemplateKind}.`);
+      }
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(config.timeoutMs);
+      const setupMarker = randomUUID();
+      let sandboxId: string | null = null;
+      try {
+        const sandbox = params.sourceTemplateRef
+          ? await client.forkSandbox(params.sourceTemplateRef, signal, {
+              egress: config.egressAllowlist,
+              autoPauseAfterSeconds: null,
+            })
+          : await client.createSandbox(signal, {
+              rootfs: await client.resolveRootfs(resolveRootfs(config), signal),
+              egress: config.egressAllowlist,
+              autoPauseAfterSeconds: null,
+            });
+        sandboxId = sandbox.id;
+        // Interactive setup must stay available until the host session expires
+        // or the user explicitly finishes/cancels it.
+        await client.setAutoPause(sandbox.id, null, signal);
+        await prepareWorkspace(client, sandbox.id, setupMarker, signal);
+        const expiresAt = params.expiresAt ?? null;
+        return {
+          providerLeaseId: sandbox.id,
+          status: "waiting_for_user",
+          expiresAt,
+          ...setupConnection(sandbox.id, expiresAt, true),
+          metadata: {
+            provider: "createos",
+            apiUrl: config.apiUrl,
+            companyId: params.companyId,
+            environmentId: params.environmentId,
+            sandboxId: sandbox.id,
+            setupMarker,
+            expiresAt,
+            sourceTemplateRefRedacted: Boolean(params.sourceTemplateRef),
+          },
+        };
+      } catch (error) {
+        if (sandboxId) {
+          try { await client.destroySandbox(sandboxId); }
+          catch { throw new Error(`CreateOS interactive setup failed and cleanup is unconfirmed for sandbox ${sandboxId}.`); }
+        }
+        throw error;
+      }
+    },
+    async onEnvironmentGetInteractiveSetup(params) {
+      if (!params.providerLeaseId) return missingSetup();
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(config.timeoutMs);
+      try {
+        const sandbox = await client.getSandbox(params.providerLeaseId, signal);
+        if (["destroyed", "failed"].includes(sandbox.status!)) return missingSetup();
+        await client.transition(params.providerLeaseId, "running", signal);
+        const expiresAt = typeof params.setupMetadata.expiresAt === "string"
+          ? params.setupMetadata.expiresAt
+          : null;
+        return {
+          providerLeaseId: params.providerLeaseId,
+          status: "waiting_for_user",
+          expiresAt,
+          ...setupConnection(params.providerLeaseId, expiresAt, params.includeConnectionPayload === true),
+          metadata: params.setupMetadata,
+        };
+      } catch (error) {
+        if (error instanceof CreateosApiError && error.status === 404) return missingSetup();
+        throw error;
+      }
+    },
+    async onEnvironmentCaptureTemplate(params) {
+      if (!params.providerLeaseId) throw new Error("Cannot capture a CreateOS template without a setup sandbox lease.");
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const timeoutMs = params.timeoutMs ?? config.timeoutMs;
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) {
+        throw new Error("Invalid CreateOS template capture timeout.");
+      }
+      const client = new CreateosClient(config);
+      const signal = AbortSignal.timeout(timeoutMs);
+      await verifyWorkspaceMarker(client, params.providerLeaseId, params.setupMetadata.setupMarker, signal);
+      // A paused CreateOS sandbox is the reusable source accepted by /fork.
+      // Do not delete it after promotion: this provider lease is the template.
+      await client.transition(params.providerLeaseId, "paused", signal);
+      return {
+        templateRef: params.providerLeaseId,
+        templateKind: "snapshot",
+        metadata: {
+          provider: "createos",
+          capturedAt: new Date().toISOString(),
+          sourceTemplateRefRedacted: Boolean(params.sourceTemplateRef),
+          previousTemplateRefRedacted: Boolean(params.previousTemplateRef),
+        },
+      };
+    },
+    async onEnvironmentCancelInteractiveSetup(params) {
+      if (!params.providerLeaseId) {
+        return { status: "missing", metadata: { provider: "createos", missing: true, reason: params.reason ?? null } };
+      }
+      if (!setupMetadataMatches(params, params.providerLeaseId, params.setupMetadata)) {
+        throw new Error("CreateOS setup sandbox does not belong to this environment.");
+      }
+      const config = parseConfig(params.config);
+      const client = new CreateosClient(config);
+      try {
+        await client.getSandbox(params.providerLeaseId, AbortSignal.timeout(config.timeoutMs));
+      } catch (error) {
+        if (error instanceof CreateosApiError && error.status === 404) {
+          return { status: "missing", metadata: { provider: "createos", missing: true, reason: params.reason ?? null } };
+        }
+        throw error;
+      }
+      await client.destroySandbox(params.providerLeaseId, AbortSignal.timeout(config.timeoutMs));
+      return {
+        status: params.reason === "timed_out" ? "timed_out" : "cancelled",
+        metadata: { provider: "createos", reason: params.reason ?? null },
+      };
+    },
+    async onEnvironmentDeleteTemplate(params) {
+      const templateKind = params.templateKind ?? "snapshot";
+      if (templateKind !== "snapshot") {
+        throw new Error(`CreateOS can delete snapshot templates only, not ${templateKind}.`);
+      }
+      const config = parseConfig(params.config);
+      await new CreateosClient(config).destroySandbox(params.templateRef, AbortSignal.timeout(config.timeoutMs));
+      return {
+        deleted: true,
+        metadata: {
+          provider: "createos",
+          templateKind: "snapshot",
+          templateRefRedacted: true,
+          reason: params.reason ?? null,
+        },
+      };
+    },
     async onEnvironmentExecute(params: PluginEnvironmentExecuteParams) {
       return track(params, (client, signal) => execute(client, params, signal,
-        (stream, text) => ctx?.execution.log(stream, text)), params.timeoutMs);
+        (stream, text) => ctx?.execution?.log(stream, text)), params.timeoutMs);
     },
     onEnvironmentSyncIn: (params) => track(params, (client, signal) => syncFiles(client, params, "in", signal)),
     onEnvironmentSyncOut: (params) => track(params, (client, signal) => syncFiles(client, params, "out", signal)),

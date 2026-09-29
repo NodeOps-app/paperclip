@@ -14,7 +14,7 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function commandScript(params: PluginEnvironmentExecuteParams, stdinPath: string | null): string {
+function commandScript(params: PluginEnvironmentExecuteParams, stdinPath: string | null, startGatePath?: string): string {
   if (!params.command) throw new Error("A sandbox command is required.");
   const env = Object.entries(params.env ?? {}).map(([key, value]) => {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== "string") {
@@ -24,6 +24,10 @@ function commandScript(params: PluginEnvironmentExecuteParams, stdinPath: string
   });
   const command = [params.command, ...(params.args ?? [])].map(shellQuote).join(" ");
   return [
+    ...(startGatePath ? [
+      `until [ -e ${shellQuote(startGatePath)} ]; do sleep 0.01; done`,
+      `rm -f -- ${shellQuote(startGatePath)}`,
+    ] : []),
     params.cwd ? `cd -- ${shellQuote(params.cwd)} || exit` : "",
     `exec env ${env.join(" ")} ${command}${stdinPath ? ` < ${shellQuote(stdinPath)}` : ""}`,
   ].filter(Boolean).join("\n");
@@ -67,16 +71,55 @@ export interface ProcessExit {
   signal: string | null;
 }
 
+interface RecoveredProcessExit extends ProcessExit {
+  newestSeq: number;
+}
+
+async function recoverProcessExit(
+  client: CreateosClient,
+  base: string,
+  cursor: number,
+  signal: AbortSignal,
+): Promise<RecoveredProcessExit> {
+  let details: Record<string, unknown>;
+  for (;;) {
+    try {
+      details = await client.json(`${base}/wait?scope=tree&timeout_ms=30000`, "GET", undefined, signal);
+      break;
+    } catch (error) {
+      if (!(error instanceof CreateosApiError && error.status === 408) || signal.aborted) throw error;
+    }
+  }
+  const output = object(details.output);
+  const newestSeq = output.newest_seq;
+  if (typeof newestSeq !== "number" || !Number.isSafeInteger(newestSeq) || newestSeq < cursor) {
+    throw new Error("CreateOS process output journal is invalid.");
+  }
+  const exitCode = details.exit_code;
+  const exitSignal = details.signal;
+  if (!(typeof exitCode === "number" && Number.isInteger(exitCode)) &&
+      !(typeof exitSignal === "string" && /^SIG[A-Z0-9]+$/.test(exitSignal))) {
+    throw new Error("CreateOS process exit status is missing.");
+  }
+  return {
+    exitCode: typeof exitCode === "number" ? exitCode : null,
+    signal: typeof exitSignal === "string" && exitSignal ? exitSignal : null,
+    newestSeq,
+  };
+}
+
 export async function followProcess(
   client: CreateosClient,
   sandboxId: string,
   processId: string,
   signal: AbortSignal,
   onData: (stream: "stdout" | "stderr" | "pty", bytes: Buffer) => void,
+  onConnected: () => void = () => {},
 ): Promise<ProcessExit> {
   const base = `/sandboxes/${identifier(sandboxId)}/processes/${identifier(processId)}`;
   let cursor = 0;
   let reconnects = 0;
+  let recoveredExit: RecoveredProcessExit | null = null;
   for (;;) {
     signal.throwIfAborted();
     let response: Response;
@@ -91,6 +134,7 @@ export async function followProcess(
       await delay(250, undefined, { signal });
       continue;
     }
+    onConnected();
     try {
       for await (const event of processEvents(response)) {
         if (event.type === "heartbeat") continue;
@@ -128,7 +172,20 @@ export async function followProcess(
     } catch (error) {
       if (!(error instanceof TypeError) || signal.aborted) throw error;
     }
-    if (++reconnects > 3) throw new Error("CreateOS process stream ended without an exit status.");
+    if (++reconnects > 3) {
+      if (recoveredExit) {
+        if (cursor === recoveredExit.newestSeq) return recoveredExit;
+        throw new Error("CreateOS process stream ended before all output could be replayed.");
+      }
+      recoveredExit = await recoverProcessExit(client, base, cursor, signal);
+      if (cursor === recoveredExit.newestSeq) return recoveredExit;
+      // The process tree is complete and its journal is now immutable. Give
+      // the public streaming proxies one bounded replay window to deliver the
+      // missing tail before treating it as data loss.
+      reconnects = 0;
+      await delay(1_000, undefined, { signal });
+      continue;
+    }
     await delay(250, undefined, { signal });
   }
 }
@@ -157,6 +214,60 @@ class Output {
   }
 }
 
+export async function executeStream(
+  client: CreateosClient,
+  params: PluginEnvironmentExecuteParams,
+  signal: AbortSignal,
+  log: (stream: "stdout" | "stderr", text: string) => void = () => {},
+): Promise<PluginEnvironmentExecuteResult> {
+  const id = identifier(params.lease.providerLeaseId);
+  const script = commandScript(params, null);
+  const output = new Output(log);
+  try {
+    const response = await client.request(`/sandboxes/${id}/exec?stream=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        cmd: "/bin/bash", args: ["-lc", script], stream: true,
+        ...(params.stdin != null ? { stdin: params.stdin } : {}),
+      }),
+      signal,
+    });
+    for await (const event of processEvents(response)) {
+      if (event.hb === true) continue;
+      if (typeof event.stdout === "string") {
+        output.write("stdout", Buffer.from(event.stdout));
+        continue;
+      }
+      if (typeof event.stderr === "string") {
+        output.write("stderr", Buffer.from(event.stderr));
+        continue;
+      }
+      if (typeof event.error === "string") throw new Error("CreateOS command stream reported an error.");
+      if (typeof event.exit_code === "number" && Number.isInteger(event.exit_code)) {
+        output.finish();
+        return {
+          exitCode: event.exit_code, signal: null, timedOut: false,
+          stdout: output.stdout, stderr: output.stderr,
+          metadata: { outputTruncated: output.truncated },
+        };
+      }
+      throw new Error("CreateOS returned an invalid command stream event.");
+    }
+    throw new Error("CreateOS command stream ended without an exit status.");
+  } catch (error) {
+    output.finish();
+    if (signal.aborted && signal.reason?.name === "TimeoutError") {
+      return {
+        exitCode: null, timedOut: true, stdout: output.stdout, stderr: output.stderr,
+        metadata: { outputTruncated: output.truncated },
+      };
+    }
+    if (signal.aborted) throw new Error("CreateOS command was cancelled.");
+    throw error;
+  }
+}
+
 // A broken output connection does not stop a managed process. Always reconnect
 // to the SAME process, never retry its creation, and explicitly terminate its
 // tree on timeout/failure. Cleanup has its own deadline, independent of execute.
@@ -168,7 +279,8 @@ export async function execute(
 ): Promise<PluginEnvironmentExecuteResult> {
   const id = identifier(params.lease.providerLeaseId);
   const stdinPath = params.stdin != null ? `/tmp/paperclip-stdin-${randomUUID()}` : null;
-  const script = commandScript(params, stdinPath);
+  const startGatePath = `/tmp/paperclip-start-${randomUUID()}`;
+  const script = commandScript(params, stdinPath, startGatePath);
   const output = new Output(log);
   let processId: string | null = null;
   let creationMayHaveSucceeded = false;
@@ -196,15 +308,27 @@ export async function execute(
     }
     processId = identifier(created.process_id);
     // No interactive stdin for ordinary commands; any supplied input comes
-    // from the staged file, avoiding a write-vs-fast-exit race.
-    try { await client.json(`${base}/${processId}/stdin/close`, "POST", undefined, signal); }
-    catch (error) {
-      if (!(error instanceof CreateosApiError && error.status === 409)) throw error;
-    }
-    const exit = await followProcess(client, id, processId, signal, (stream, bytes) => {
+    // from the staged file. The command waits on startGatePath so the public
+    // stream is attached before a fast command can emit output and exit.
+    let connectedResolve!: () => void;
+    const connected = new Promise<void>((resolve) => { connectedResolve = resolve; });
+    const follow = followProcess(client, id, processId, signal, (stream, bytes) => {
       if (stream === "pty") throw new Error("CreateOS pipe process returned PTY output.");
       output.write(stream, bytes);
-    });
+    }, connectedResolve);
+    // If gate upload or stdin close fails, cleanup below terminates the
+    // managed process. Mark the follower handled while that cleanup completes.
+    void follow.catch(() => undefined);
+    const closeStdin = client.json(`${base}/${processId}/stdin/close`, "POST", undefined, signal)
+      .catch((error) => {
+        if (!(error instanceof CreateosApiError && error.status === 409)) throw error;
+      });
+    await Promise.race([
+      connected,
+      follow.then(() => { throw new Error("CreateOS process ended before its output stream connected."); }),
+    ]);
+    await client.upload(id, startGatePath, "", signal);
+    const [exit] = await Promise.all([follow, closeStdin]);
     completed = true;
     output.finish();
     return {
@@ -238,11 +362,11 @@ export async function execute(
         catch (error) { if (!(error instanceof CreateosApiError && error.status === 404)) throw new CreateosCleanupError("CreateOS command cleanup failed; process termination is unconfirmed."); }
       }
     } finally {
-      if (staged && stdinPath) {
+      if (processId || staged) {
         // /files has no delete verb. /exec supplies a bounded, one-shot removal
         // after the managed process finishes, without retaining another record.
         await client.json(`/sandboxes/${id}/exec`, "POST", {
-          cmd: "/bin/rm", args: ["-f", "--", stdinPath],
+          cmd: "/bin/rm", args: ["-f", "--", startGatePath, ...(stdinPath ? [stdinPath] : [])],
         }, cleanupSignal).catch(() => undefined);
       }
     }

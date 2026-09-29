@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPlugin } from "./plugin.js";
 import { parseConfig } from "./config.js";
 import manifest from "./manifest.js";
-import { execute } from "./execute.js";
+import { execute, executeStream } from "./execute.js";
 import { CreateosClient } from "./client.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 vi.mock("./request-pacer.js", () => ({ waitForRequest: vi.fn().mockResolvedValue(undefined) }));
 
-const config = { apiUrl: "https://createos.example.test", apiKey: "test-secret", shape: "test-shape", timeoutMs: 5000 };
+const config = { apiUrl: "https://createos.example.test", apiKey: "test-secret", shape: "test-shape", rootfs: "devbox:1", timeoutMs: 5000 };
 const base = { driverKey: "createos", companyId: "company-a", environmentId: "env-a", issueId: "issue-a", config };
 const success = (data: unknown = {}) => Response.json({ status: "success", data });
 const failure = (status: number) => Response.json({ status: "fail", data: "private provider diagnostics test-secret" }, { status });
@@ -19,8 +19,8 @@ const ndjson = (frames: unknown[]) => new Response(frames.map((frame) => JSON.st
 type Call = { path: string; method: string; body: Record<string, unknown>; init: RequestInit };
 function provider() {
   const calls: Call[] = [];
-  let state = "running";
-  let marker = "";
+  const states = new Map<string, string>([["sb_test", "running"], ["sb_golden", "paused"]]);
+  const markers = new Map<string, string>();
   let processCount = 0;
   const fetchMock = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
     const parsed = new URL(String(url));
@@ -31,17 +31,31 @@ function provider() {
     calls.push({ path, method, body, init });
     expect(init.headers).toMatchObject({ "X-Api-Key": "test-secret" });
     expect(init.redirect).toBe("error");
-    if (path === "/v1/sandboxes" && method === "POST") return success({ id: "sb_test" });
-    if (path === "/v1/sandboxes/sb_test" && method === "GET") return success({ id: "sb_test", status: state });
-    if (path === "/v1/sandboxes/sb_test" && method === "DELETE") { state = "destroyed"; return success({ id: "sb_test" }); }
-    if (path.endsWith("/pause")) { state = "paused"; return success({ status: "pausing" }); }
-    if (path.endsWith("/resume")) { state = "running"; return success({ status: "resuming" }); }
-    if (path.endsWith("/egress") && method === "PUT") return success({ id: "sb_test", egress: body.egress });
+    if (path === "/v1/sandboxes" && method === "POST") { states.set("sb_test", "running"); return success({ id: "sb_test" }); }
+    if (path === "/v1/rootfs" && method === "GET") return success({ rootfs: ["devbox:1"], default: "devbox:1" });
+    const sandboxId = parsed.pathname.match(/^\/v1\/sandboxes\/([A-Za-z0-9_-]+)/)?.[1];
+    if (path.endsWith("/fork") && method === "POST") { states.set("sb_fork", "running"); return success({ id: "sb_fork" }); }
+    if (sandboxId && parsed.pathname === `/v1/sandboxes/${sandboxId}` && method === "GET") {
+      const state = states.get(sandboxId);
+      if (!state || state === "destroyed") return failure(404);
+      return success({ id: sandboxId, status: state });
+    }
+    if (sandboxId && parsed.pathname === `/v1/sandboxes/${sandboxId}` && method === "DELETE") {
+      states.set(sandboxId, "destroyed");
+      return success({ id: sandboxId });
+    }
+    if (sandboxId && parsed.pathname === `/v1/sandboxes/${sandboxId}` && method === "PATCH") return success({ id: sandboxId });
+    if (sandboxId && path.endsWith("/pause")) { states.set(sandboxId, "paused"); return success({ status: "pausing" }); }
+    if (sandboxId && path.endsWith("/resume")) { states.set(sandboxId, "running"); return success({ status: "resuming" }); }
+    if (sandboxId && path.endsWith("/egress") && method === "PUT") return success({ id: sandboxId, egress: body.egress });
     if (parsed.pathname.endsWith("/files") && method === "PUT") {
-      if (parsed.searchParams.get("path")?.endsWith(".paperclip-createos-lease")) marker = raw;
+      if (sandboxId && parsed.searchParams.get("path")?.endsWith(".paperclip-createos-lease")) markers.set(sandboxId, raw);
       return success();
     }
-    if (path.endsWith("/exec")) return success({ result: { exit_code: 0, stdout: body.cmd === "/bin/cat" ? marker : "", stderr: "" } });
+    if (parsed.pathname.endsWith("/exec") && parsed.searchParams.get("stream") === "true") {
+      return ndjson([{ stdout: "paperclip-createos-ready\n" }, { exit_code: 0 }]);
+    }
+    if (path.endsWith("/exec")) return success({ result: { exit_code: 0, stdout: body.cmd === "/bin/cat" && sandboxId ? markers.get(sandboxId) ?? "" : "", stderr: "" } });
     if (path.endsWith("/processes") && method === "POST") {
       // These sandboxes declare no creation-time env keys. Match the real
       // provider's rejection of undeclared API-level overrides.
@@ -57,7 +71,12 @@ function provider() {
     throw new Error(`Unhandled fixture request ${method} ${path}`);
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { calls, fetchMock, setState: (value: string) => { state = value; }, setMarker: (value: string) => { marker = value; } };
+  return {
+    calls,
+    fetchMock,
+    setState: (value: string, id = "sb_test") => { states.set(id, value); },
+    setMarker: (value: string, id = "sb_test") => { markers.set(id, value); },
+  };
 }
 
 function executionParams(overrides = {}) {
@@ -90,6 +109,99 @@ describe("CreateOS lifecycle", () => {
     expect(egress).toBeLessThan(resume);
     await hooks.onEnvironmentDestroyLease!({ ...params, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata });
     expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
+  });
+
+  it("captures an interactive setup sandbox and forks it for normal leases", async () => {
+    const fake = provider();
+    const hooks = createPlugin().definition;
+    const expiresAt = "2026-09-30T12:00:00.000Z";
+    const setup = await hooks.onEnvironmentStartInteractiveSetup!({
+      ...base,
+      sessionId: "setup-a",
+      expiresAt,
+    });
+    expect(setup).toMatchObject({
+      providerLeaseId: "sb_test",
+      status: "waiting_for_user",
+      connectionSummary: { type: "createos_cli", commandRedacted: false },
+      connectionPayload: { type: "createos_cli", command: "createos sandbox shell sb_test" },
+    });
+    expect(JSON.stringify(setup)).not.toContain("test-secret");
+    expect(fake.calls.some((call) => call.method === "PATCH" && call.body.disable_auto_pause === true)).toBe(true);
+
+    const redacted = await hooks.onEnvironmentGetInteractiveSetup!({
+      ...base,
+      providerLeaseId: setup.providerLeaseId,
+      setupMetadata: setup.metadata,
+      includeConnectionPayload: false,
+    });
+    expect(redacted.connectionPayload).toBeNull();
+    expect(redacted.connectionSummary).toMatchObject({ type: "createos_cli", commandRedacted: true });
+    const connected = await hooks.onEnvironmentGetInteractiveSetup!({
+      ...base,
+      providerLeaseId: setup.providerLeaseId,
+      setupMetadata: setup.metadata,
+      includeConnectionPayload: true,
+    });
+    expect(connected.connectionPayload?.command).toBe("createos sandbox shell sb_test");
+
+    const captured = await hooks.onEnvironmentCaptureTemplate!({
+      ...base,
+      providerLeaseId: setup.providerLeaseId,
+      setupMetadata: setup.metadata,
+      templateLabel: "ready",
+    });
+    expect(captured).toMatchObject({ templateKind: "snapshot", templateRef: "sb_test" });
+    expect(fake.calls.some((call) => call.path === "/v1/sandboxes/sb_test/pause")).toBe(true);
+
+    const leaseParams = { ...base, config: { ...config, snapshot: captured.templateRef, reuseLease: true } };
+    const lease = await hooks.onEnvironmentAcquireLease!({ ...leaseParams, runId: "run-from-template" });
+    expect(lease).toMatchObject({ providerLeaseId: "sb_fork", metadata: { snapshot: "sb_test" } });
+    const fork = fake.calls.find((call) => call.path === "/v1/sandboxes/sb_test/fork");
+    expect(fork?.body).toMatchObject({ start_paused: false, egress: ["*"], ingress_enabled: false });
+    expect(fake.calls.some((call) => call.path === "/v1/sandboxes/sb_fork" && call.method === "PATCH" && call.body.auto_pause_after_seconds === 600)).toBe(true);
+
+    await hooks.onEnvironmentDestroyLease!({
+      ...leaseParams,
+      providerLeaseId: lease.providerLeaseId,
+      leaseMetadata: lease.metadata,
+    });
+    await hooks.onEnvironmentDeleteTemplate!({
+      ...base,
+      templateRef: captured.templateRef,
+      templateKind: captured.templateKind,
+      reason: "test cleanup",
+    });
+    expect(fake.calls.some((call) => call.path === "/v1/sandboxes/sb_test" && call.method === "DELETE")).toBe(true);
+  });
+
+  it("forks an existing template for editing, cancels it, and rejects cross-company setup access", async () => {
+    const fake = provider();
+    const hooks = createPlugin().definition;
+    const setup = await hooks.onEnvironmentStartInteractiveSetup!({
+      ...base,
+      sessionId: "setup-derived",
+      sourceTemplateRef: "sb_golden",
+      sourceTemplateKind: "snapshot",
+    });
+    expect(setup.providerLeaseId).toBe("sb_fork");
+    expect(fake.calls.some((call) => call.path === "/v1/sandboxes/sb_golden/fork")).toBe(true);
+    fake.fetchMock.mockClear();
+    await expect(hooks.onEnvironmentGetInteractiveSetup!({
+      ...base,
+      companyId: "company-b",
+      providerLeaseId: setup.providerLeaseId,
+      setupMetadata: setup.metadata,
+      includeConnectionPayload: true,
+    })).rejects.toThrow("does not belong");
+    expect(fake.fetchMock).not.toHaveBeenCalled();
+    expect(await hooks.onEnvironmentCancelInteractiveSetup!({
+      ...base,
+      providerLeaseId: setup.providerLeaseId,
+      setupMetadata: setup.metadata,
+      reason: "cancelled_by_user",
+    })).toMatchObject({ status: "cancelled" });
+    expect(fake.calls.at(-1)).toMatchObject({ path: "/v1/sandboxes/sb_fork", method: "DELETE" });
   });
 
   it("cleans up failed acquisition and never hides delete failure", async () => {
@@ -209,7 +321,7 @@ describe("CreateOS lifecycle", () => {
       rootfs: "codex-ready",
       egress: ["registry.npmjs.org", "github.com", "10.0.0.0/8"],
     });
-    expect(lease.metadata).toMatchObject({ adapterType: "codex", rootfs: "codex-ready" });
+    expect(lease.metadata).toMatchObject({ adapterType: "codex", rootfs: "codex-ready", requestedRootfs: "codex-ready" });
   });
 
   it("expires a reusable lease before provider access when adapter image, base egress, or auto-pause changes", async () => {
@@ -347,7 +459,7 @@ describe("CreateOS lifecycle", () => {
     expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
   });
 
-  it("aborts an active command and waits for tree cleanup before leaving the sandbox warm", async () => {
+  it("aborts an active streaming command before releasing its lease", async () => {
     const fake = provider();
     const hooks = createPlugin().definition;
     const params = { ...base, config: { ...config, reuseLease: true } };
@@ -355,10 +467,14 @@ describe("CreateOS lifecycle", () => {
     const normal = fake.fetchMock.getMockImplementation()!;
     let streaming!: () => void;
     const ready = new Promise<void>((resolve) => { streaming = resolve; });
+    let streamAborted = false;
     fake.fetchMock.mockImplementation(async (url, init) => {
-      if (String(url).includes("/connect?")) return new Response(new ReadableStream({
+      if (String(url).includes("/exec?stream=true")) return new Response(new ReadableStream({
         start(controller) {
-          init!.signal!.addEventListener("abort", () => controller.error(init!.signal!.reason), { once: true });
+          init!.signal!.addEventListener("abort", () => {
+            streamAborted = true;
+            controller.error(init!.signal!.reason);
+          }, { once: true });
           streaming();
         },
       }));
@@ -369,20 +485,19 @@ describe("CreateOS lifecycle", () => {
     await ready;
     await hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata });
     await rejected;
-    const stop = fake.calls.findIndex((call) => call.method === "DELETE" && call.path.includes("/processes/"));
-    expect(stop).toBeGreaterThan(-1);
+    expect(streamAborted).toBe(true);
     expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
   });
 
-  it("blocks reuse after ambiguous process creation until the sandbox is destroyed", async () => {
+  it("does not poison a lease when streaming command startup fails", async () => {
     const fake = provider();
     const hooks = createPlugin().definition;
     const params = { ...base, config: { ...config, reuseLease: true } };
     const lease = await hooks.onEnvironmentAcquireLease!({ ...params, runId: "run" });
     const normal = fake.fetchMock.getMockImplementation()!;
-    fake.fetchMock.mockImplementation(async (url, init) => String(url).endsWith("/processes") ? failure(502) : normal(url, init));
-    await expect(hooks.onEnvironmentExecute!({ ...params, lease, command: "sleep" })).rejects.toThrow("creation could not be confirmed");
-    await expect(hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata })).rejects.toThrow("cleanup is unconfirmed");
+    fake.fetchMock.mockImplementation(async (url, init) => String(url).includes("/exec?stream=true") ? failure(502) : normal(url, init));
+    await expect(hooks.onEnvironmentExecute!({ ...params, lease, command: "sleep" })).rejects.toThrow("HTTP 502");
+    await hooks.onEnvironmentReleaseLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata });
     expect(fake.calls.some((call) => call.path.endsWith("/pause"))).toBe(false);
     await hooks.onEnvironmentDestroyLease!({ ...params, providerLeaseId: "sb_test", leaseMetadata: lease.metadata });
     expect(fake.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/sandboxes/sb_test" });
@@ -395,7 +510,7 @@ describe("CreateOS lifecycle", () => {
     fake.fetchMock.mockImplementation(async (url, init) => {
       if (String(url).endsWith("/sb_test") && (!init?.method || init.method === "GET")) {
         reads++;
-        return success({ id: "sb_test", status: reads <= 2 ? "paused" : reads === 3 ? "resuming" : "running" });
+        return success({ id: "sb_test", status: reads === 1 ? "forking" : reads === 2 ? "paused" : reads === 3 ? "resuming" : "running" });
       }
       return normal(url, init);
     });
@@ -406,6 +521,29 @@ describe("CreateOS lifecycle", () => {
 });
 
 describe("CreateOS command protocol", () => {
+  it("streams ordinary commands with quoted cwd/env/args and atomic stdin", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      if (String(url).includes("/exec?stream=true")) {
+        // Record the request through the normal fixture before replacing its response.
+        await normal(url, init);
+        return ndjson([{ stdout: "out" }, { stderr: "warn" }, { exit_code: 7 }]);
+      }
+      return normal(url, init);
+    });
+    const result = await executeStream(new CreateosClient(parseConfig(config)), executionParams({
+      command: "printf", args: ["a'; touch /bad; echo '"], cwd: "/work dir",
+      env: { MESSAGE: "$(touch /bad)" }, stdin: "secret input\n",
+    }), AbortSignal.timeout(5000));
+    expect(result).toMatchObject({ exitCode: 7, stdout: "out", stderr: "warn", timedOut: false });
+    const request = fake.calls.find((call) => call.path.includes("/exec?stream=true"))!;
+    expect(request.body).toMatchObject({ cmd: "/bin/bash", stdin: "secret input\n", stream: true });
+    expect((request.body.args as string[])[1]).toContain("cd -- '/work dir'");
+    expect((request.body.args as string[])[1]).toContain("MESSAGE='$(touch /bad)'");
+    expect((request.body.args as string[])[1]).toContain("'a'\"'\"'; touch /bad; echo '\"'\"''");
+  });
+
   it("quotes hostile args/env/cwd and stages stdin instead of racing the input endpoint", async () => {
     const fake = provider();
     const result = await execute(new CreateosClient(parseConfig(config)), executionParams({
@@ -419,7 +557,12 @@ describe("CreateOS command protocol", () => {
     expect((create.body.args as string[])[1]).toContain("MESSAGE='$(touch /bad)'");
     expect((create.body.args as string[])[1]).toContain("'a'\"'\"'; touch /bad; echo '\"'\"''");
     expect((create.body.args as string[])[1]).not.toContain("secret input");
+    expect((create.body.args as string[])[1]).toContain("paperclip-start-");
     expect(fake.calls.some((call) => call.path.endsWith("/input"))).toBe(false);
+    expect(fake.calls.findIndex((call) => call.path.includes("/connect?")))
+      .toBeLessThan(fake.calls.findIndex((call) => call.path.endsWith("/stdin/close")));
+    expect(fake.calls.findIndex((call) => call.path.includes("/connect?")))
+      .toBeLessThan(fake.calls.findIndex((call) => call.path.includes("paperclip-start-")));
     expect(fake.calls.at(-1)?.body).toMatchObject({ cmd: "/bin/rm" });
   });
 
@@ -442,6 +585,43 @@ describe("CreateOS command protocol", () => {
     expect(result).toMatchObject({ exitCode: 7, stdout: "€", stderr: "warning", timedOut: false });
     expect(log.mock.calls).toEqual([["stdout", "€"], ["stderr", "warning"]]);
     expect(fake.calls.filter((call) => call.path.endsWith("/processes") && call.method === "POST")).toHaveLength(1);
+  });
+
+  it("recovers an exit from wait only after all streamed output was received", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    let connects = 0;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes("/connect?")) {
+        connects++;
+        return connects === 1 ? ndjson([data(1, "complete")]) : ndjson([]);
+      }
+      if (requestUrl.includes("/wait?scope=tree")) {
+        return success({ state: "exited", tree_exited: true, exit_code: 0, signal: "", output: { newest_seq: 1 } });
+      }
+      return normal(url, init);
+    });
+    const result = await execute(new CreateosClient(parseConfig(config)), executionParams(), AbortSignal.timeout(5000));
+    expect(result).toMatchObject({ exitCode: 0, stdout: "complete", timedOut: false });
+    expect(connects).toBe(4);
+    expect(fake.fetchMock.mock.calls.some(([url]) => String(url).includes("/wait?scope=tree"))).toBe(true);
+  });
+
+  it("rejects wait recovery when streamed output is incomplete", async () => {
+    const fake = provider();
+    const normal = fake.fetchMock.getMockImplementation()!;
+    fake.fetchMock.mockImplementation(async (url, init) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes("/connect?")) return ndjson([]);
+      if (requestUrl.includes("/wait?scope=tree")) {
+        return success({ state: "exited", tree_exited: true, exit_code: 0, signal: "", output: { newest_seq: 1 } });
+      }
+      return normal(url, init);
+    });
+    await expect(execute(new CreateosClient(parseConfig(config)), executionParams(), AbortSignal.timeout(5000)))
+      .rejects.toThrow("before all output could be replayed");
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("/processes/proc_test?grace_ms=1000"))).toBe(true);
   });
 
   it.each([
@@ -473,7 +653,7 @@ describe("CreateOS command protocol", () => {
     });
     const result = await execute(new CreateosClient(parseConfig(config)), executionParams(), AbortSignal.timeout(50));
     expect(result).toMatchObject({ exitCode: null, timedOut: true, stdout: "partial" });
-    expect(fake.calls.at(-1)?.method).toBe("DELETE");
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("/processes/proc_test?grace_ms=1000"))).toBe(true);
   });
 
   it("reports unconfirmed termination rather than hiding cleanup failure", async () => {
@@ -495,6 +675,13 @@ describe("CreateOS configuration", () => {
     expect(parseConfig({ ...config, apiUrl: config.apiUrl + "/v1/" }).apiUrl).toBe(config.apiUrl);
     expect(() => parseConfig({ ...config, shape: "" })).toThrow("shape");
     expect(manifest.environmentDrivers?.[0].supportsLoginPty).toBe(true);
+    expect(manifest.environmentDrivers?.[0]).toMatchObject({
+      supportsInteractiveSetup: true,
+      interactiveSetupConnectionTypes: ["createos_cli"],
+      supportsTemplateCapture: true,
+      templateRefKind: "snapshot",
+      supportsTemplateDelete: true,
+    });
     expect(manifest.environmentDrivers?.[0].sandboxCapabilities).toMatchObject({
       concurrentSyncOperations: true,
       duplexCommandStream: true,
@@ -502,15 +689,28 @@ describe("CreateOS configuration", () => {
     const hooks = createPlugin().definition;
     for (const name of [
       "onEnvironmentSyncIn", "onEnvironmentSyncOut",
+      "onEnvironmentStartInteractiveSetup", "onEnvironmentGetInteractiveSetup",
+      "onEnvironmentCaptureTemplate", "onEnvironmentCancelInteractiveSetup", "onEnvironmentDeleteTemplate",
       "onLoginPtyOpen", "onLoginPtyInput", "onLoginPtyStop", "onLoginPtyClose",
       "onDuplexChannelOpen", "onDuplexChannelWrite", "onDuplexChannelStop", "onDuplexChannelClose",
     ] as const) expect(hooks[name]).toBeTypeOf("function");
   });
 
+  it("resolves the provider rootfs default when configuration omits one", async () => {
+    const fake = provider();
+    const hooks = createPlugin().definition;
+    const withoutRootfs = { ...config, rootfs: undefined };
+    const lease = await hooks.onEnvironmentAcquireLease!({ ...base, config: withoutRootfs, runId: "default-rootfs" });
+    expect(fake.calls[0]).toMatchObject({ path: "/v1/rootfs", method: "GET" });
+    expect(fake.calls[1].body).toMatchObject({ rootfs: "devbox:1" });
+    expect(lease.metadata).toMatchObject({ rootfs: "devbox:1", requestedRootfs: null });
+  });
+
   it("validates adapter images and egress lists", () => {
-    expect(parseConfig({ ...config, rootfsByAdapter: { codex: " codex-ready " }, egressAllowlist: ["github.com", "github.com"] })).toMatchObject({
-      rootfsByAdapter: { codex: "codex-ready" }, egressAllowlist: ["github.com"],
+    expect(parseConfig({ ...config, snapshot: " sb_ready ", rootfsByAdapter: { codex: " codex-ready " }, egressAllowlist: ["github.com", "github.com"] })).toMatchObject({
+      snapshot: "sb_ready", rootfsByAdapter: { codex: "codex-ready" }, egressAllowlist: ["github.com"],
     });
+    expect(() => parseConfig({ ...config, snapshot: "" })).toThrow("snapshot");
     expect(() => parseConfig({ ...config, rootfsByAdapter: [] })).toThrow("rootfsByAdapter");
     expect(() => parseConfig({ ...config, egressAllowlist: [""] })).toThrow("egressAllowlist");
   });

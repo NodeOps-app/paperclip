@@ -264,6 +264,41 @@ describe("JsonSchemaForm secret-ref rendering", () => {
     });
   });
 
+  it("uses the first string example as a placeholder without setting the value", async () => {
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <JsonSchemaForm
+          schema={{
+            type: "object",
+            properties: {
+              rootfs: { type: "string", examples: ["devbox:1"] },
+              region: { type: "string", examples: ["eu"] },
+              snapshot: { type: "string", examples: ["sb-..."] },
+            },
+          }}
+          values={{}}
+          onChange={() => {}}
+        />,
+      );
+    });
+
+    const rootfs = container.querySelector<HTMLInputElement>('input[aria-label="Rootfs"]');
+    const region = container.querySelector<HTMLInputElement>('input[aria-label="Region"]');
+    const snapshot = container.querySelector<HTMLInputElement>('input[aria-label="Snapshot"]');
+    expect(rootfs?.placeholder).toBe("devbox:1");
+    expect(rootfs?.value).toBe("");
+    expect(region?.placeholder).toBe("eu");
+    expect(region?.value).toBe("");
+    expect(snapshot?.placeholder).toBe("sb-...");
+    expect(snapshot?.value).toBe("");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("hides advanced fields behind a collapsed disclosure with group headings", async () => {
     const root = createRoot(container);
 

@@ -2,6 +2,7 @@ export interface CreateosConfig {
   apiUrl: string;
   apiKey: string | null;
   shape: string;
+  snapshot: string | null;
   rootfs: string | null;
   rootfsByAdapter: Record<string, string>;
   egressAllowlist: string[];
@@ -72,6 +73,7 @@ export function parseConfig(raw: Record<string, unknown>): CreateosConfig {
     apiUrl: url.origin,
     apiKey: text("apiKey"),
     shape,
+    snapshot: text("snapshot"),
     rootfs: text("rootfs"),
     rootfsByAdapter,
     egressAllowlist,
